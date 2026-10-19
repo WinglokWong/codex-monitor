@@ -1,23 +1,25 @@
-# Codex Monitor v1.1.0
+# Codex Monitor v1.1.1
 
-新增账户信息行，便于确认当前显示的是哪个 Codex CLI 账户的周额度。
+修复正常账户状态通知被误判为账户变化、导致额度查询失败的问题，并补充错误原因与自动重试。
 
-- 显示脱敏邮箱与账户套餐，通过同一个本地 Codex CLI 的 `account/read` 和 `account/rateLimits/read` 查询账户及额度，每分钟自动刷新，也支持手动刷新。
-- 明确显示 API key 模式和未登录状态；邮箱缺失或为 `null` 时显示无邮箱信息。
-- 刷新失败时清空旧账户和旧额度，显示错误状态，避免切换登录后误认旧账户数据。
-- 原始邮箱仅在内存中处理，不持久化或提交到仓库；token 仍由 Codex 管理。账户自测使用虚构数据。
+- 不再仅凭 `account/updated` 通知判定账户已切换；再次确认身份未变化后正常显示额度。查询期间确认账户确实变化时，仍会拒绝结果。
+- 底部直接显示「查询超时」「网络暂不可用」「需要重新登录」等简短原因。信息按钮及「上次查询错误」菜单可查看失败时间和安全处理后的详细说明；恢复后仍可查看，记录仅保存在本次运行的内存中。
+- 对暂时故障最多追加两次快速重试：首次失败后等待 3 秒，第一次重试失败后再等待 8 秒；之后等待常规刷新或手动刷新。登录失效、CLI 未安装、请求过于频繁等错误不快速重试。
+- 保持原有的数据处理：刷新失败立即清空旧账户和旧额度，成功后再恢复显示，避免误认上一个账户的数据。退出时停止查询和重试，迟到回调不会恢复旧状态。
 
 未增加登录或切换账户界面。在现有 Codex CLI 中更换登录后，下一次成功刷新会显示新账户。CLI 与桌面应用使用不同登录时，以 CLI 当前账户为准。
 
-继续提供剩余周额度、北京时间重置倒计时，以及每秒更新的 CPU、内存、上传／下载速率。保留可拖动置顶面板、位置记忆、Dock 和菜单栏入口及快捷键。
+继续显示脱敏邮箱与套餐、剩余周额度、北京时间重置倒计时，以及每秒更新的 CPU、内存、上传／下载速率。监控程序不持久化原始邮箱，也不读取或保存 token；仓库中的账户测试使用虚构数据。
 
 ## 下载与安装
 
-从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.0-universal.dmg`。支持 macOS 13 及更新版本，包含 Apple Silicon（arm64）和 Intel（x86_64）架构。
+从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.1-universal.dmg`。支持 macOS 13 及更新版本，包含 Apple Silicon（arm64）和 Intel（x86_64）架构。
 
 已在 macOS 26 / Apple Silicon 实机验证。Intel 二进制已构建，尚未在 Intel Mac 实机验证。
 
 打开 DMG，将 **Codex Monitor.app** 拖入 **Applications**，再从“应用程序”启动。周额度需要本机已安装 Codex，并登录支持额度查询的账户。启动后，将面板拖到宠物旁即可。
+
+从旧版升级时先退出 Codex Monitor，再替换应用。面板位置与置顶设置会保留。
 
 同时下载发布附件中的 `SHA256SUMS.txt`，在两个下载文件所在的目录执行 `shasum -a 256 -c SHA256SUMS.txt`，可核对 DMG 是否完整。
 

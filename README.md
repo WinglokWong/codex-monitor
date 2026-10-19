@@ -8,7 +8,7 @@
 
 ## 下载与安装
 
-从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.0-universal.dmg`，打开后将 **Codex Monitor.app** 拖入 **Applications**，再从应用程序目录启动。
+从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.1-universal.dmg`，打开后将 **Codex Monitor.app** 拖入 **Applications**，再从应用程序目录启动。升级时先退出旧版，再用新版替换应用；面板位置和置顶设置会保留。
 
 - macOS 13 及以上，Universal 二进制支持 Apple Silicon 和 Intel。
 - 已在 macOS 26 / Apple Silicon 实机验证；Intel 构建已完成，尚未在 Intel Mac 实机验证。
@@ -22,7 +22,8 @@
 
 - 拖动面板标题或空白处改变位置。
 - 右上角刷新按钮立即重新查询账户与额度。
-- `…` 菜单可切换置顶、隐藏面板或退出。
+- `…` 菜单可切换置顶、隐藏面板、查看上次查询错误或退出。
+- 查询失败后，底部显示简短原因与重试状态；点击右侧信息按钮或「上次查询错误」可查看失败时间和安全处理后的详细说明。查询恢复后仍可查看该记录，退出应用后清除。
 - 隐藏后，点击 Dock 图标恢复；也可点击 macOS 菜单栏的波形图标，选择「显示面板」。
 - Dock 图标右键菜单提供「显示监控面板」「刷新额度」；应用菜单支持 `⌘R` 刷新、`⌘1` 显示面板、`⌘Q` 退出。
 - 不自动设置开机启动。退出监控会停止定时采样和额度查询。
@@ -46,7 +47,11 @@
 
 刷新失败时会清空旧账户和旧额度，并显示不可用及错误状态，避免把上一个账户的数据当成当前数据；把鼠标停在底部状态上可查看错误。API key 模式和未登录状态会分别标明；邮箱未知或为 `null` 时显示无邮箱信息，不猜测账户身份。没有周窗口的账户显示周额度暂不可用。
 
-账户行仅显示脱敏邮箱。账户查询涉及的原始邮箱仅在内存中处理，不写入持久化文件或仓库；token 由 Codex 管理，监控程序不读取或保存 token。仓库中的账户测试样例均使用虚构数据。
+网络暂不可用、查询超时等暂时故障会在当前刷新周期内最多追加两次快速重试：首次失败后等待 3 秒，第一次重试失败后再等待 8 秒。之后等待下一次每分钟刷新，也可手动刷新；手动刷新会重新开始重试预算。登录失效、CLI 未安装或请求过于频繁等需要用户处理或等待的错误，不进行快速重试。
+
+正常的账户状态通知不会直接导致查询失败；程序会再次核对账户身份。查询期间确认账户确实变化时，仍会拒绝这次结果，避免把不同账户与额度混在一起。
+
+账户行仅显示脱敏邮箱。账户查询涉及的原始邮箱仅在内存中处理，不写入持久化文件或仓库；token 由 Codex 管理，监控程序不读取或保存 token。上次查询错误仅在本次运行的内存中保留分类后的说明，不保存原始服务端诊断或认证日志。仓库中的账户测试样例均使用虚构数据。
 
 ## 编译与检查
 
@@ -60,9 +65,9 @@ python3 Tests/test-quota-protocol.py
 ./scripts/package-release.sh
 ```
 
-`--self-test` 检查账户字段与邮箱脱敏、额度字段解析、过期和缺失值、CPU 计数回绕、网络接口变化及计数器重置、时区和显示单位，不访问网络。`--probe` 输出一次真实系统及账户／额度查询结果；不要在无法启动 Codex 子进程的受限沙箱内运行它。
+`--self-test` 检查账户字段与邮箱脱敏、额度字段解析、重试预算与停止／重启后的回调处理、过期和缺失值、CPU 计数回绕、网络接口变化及计数器重置、时区和显示单位，不访问网络。`--probe` 输出一次真实系统及账户／额度查询结果；不要在无法启动 Codex 子进程的受限沙箱内运行它。
 
-可选的 Python 协议测试用模拟 CLI 检查账户切换、身份确认和异常响应，不连接真实账户或网络；应用运行本身不需要 Python。
+可选的 Python 协议测试用模拟 CLI 检查正常账户通知、账户切换、身份确认和异常响应，不连接真实账户或网络；应用运行本身不需要 Python。
 
 构建脚本使用 Release 优化，为 `arm64` 和 `x86_64` 分别编译，再合成为 Universal 应用并进行本地 ad-hoc 签名。打包脚本验证架构、签名和自测，生成 `dist/` 下的 DMG 与 SHA-256 校验文件；不包含 Codex CLI、账户凭据或本机代理配置。
 
@@ -72,6 +77,6 @@ python3 Tests/test-quota-protocol.py
 
 - `Sources/QuotaClient.swift`：独立启动 `codex app-server --listen stdio://`，完成初始化后调用 `account/read` 与 `account/rateLimits/read`，20 秒超时。只读取账户信息和额度，不创建模型对话，不消费重置次数。认证由 Codex 自行管理，面板不读取或保存 token，也不保存原始认证日志。
 - `Sources/SystemMetrics.swift`：Mach CPU / VM 计数器和 `NET_RT_IFLIST2` 64 位网卡统计。内存估算公式为 `(max(internal − purgeable, 0) + wired + physical compressor) × page size`。
-- `Sources/MonitorModel.swift`、`MonitorView.swift`、`main.swift`：刷新、显示、浮动窗口、菜单栏入口及位置记忆。
+- `Sources/MonitorModel.swift`、`MonitorView.swift`、`main.swift`：刷新与有次数上限的重试、安全错误说明、浮动窗口、菜单栏入口及位置记忆。
 
 官方 [Pets 文档](https://learn.chatgpt.com/docs/pets?surface=app) 没有列出向内置宠物注入实时自定义指标的公开接口，因此采用独立面板。[Codex App Server 文档](https://learn.chatgpt.com/docs/app-server) 定义了额度读取接口与字段；该接口可能随 Codex 版本演进。

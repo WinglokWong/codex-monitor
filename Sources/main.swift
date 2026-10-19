@@ -228,7 +228,11 @@ func runProbe() -> Int32 {
              "resetsAt": quota.resetsAt.map { MonitorFormat.resetDate.string(from: $0) } as Any? ?? NSNull()] as [String: Any]
         }
         success = true
-    case .failure(let error): output["quotaError"] = error.localizedDescription
+    case .failure(let error):
+        let safeError = error as? QuotaClientError ?? .serviceUnavailable
+        output["quotaError"] = safeError.localizedDescription
+        output["quotaErrorShort"] = safeError.shortDescription
+        output["quotaRetryable"] = safeError.shouldRetry
     case .none: output["quotaError"] = "Probe timed out"
     }
     if let data = try? JSONSerialization.data(withJSONObject: output, options: [.prettyPrinted, .sortedKeys]), let text = String(data: data, encoding: .utf8) { print(text) }
@@ -241,6 +245,7 @@ if CommandLine.arguments.contains("--self-test") {
         try runSystemMetricTests()
         try runFormatTests()
         try runAccountStateTests()
+        try runRetryStateTests()
         print("PASS: quota and account parsing, identity state, system counters, and display semantics")
         exit(0)
     } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }

@@ -6,6 +6,7 @@ private let monitorMuted = Color(red: 0.59, green: 0.64, blue: 0.67)
 
 struct MonitorView: View {
     @ObservedObject var model: MonitorModel
+    @State private var showingQueryError = false
     var hide: () -> Void
     var togglePinned: () -> Void
 
@@ -17,10 +18,12 @@ struct MonitorView: View {
                 Spacer()
                 Button(action: { model.refreshQuota() }) {
                     Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .medium))
-                }.buttonStyle(.plain).disabled(model.isRefreshing).help("刷新周额度（每分钟自动更新）")
+                }.buttonStyle(.plain).disabled(model.isRefreshing).help("刷新账号与额度（每分钟自动更新）")
                 Menu {
                     Button(model.pinned ? "取消置顶" : "保持置顶", action: togglePinned)
                     Button("隐藏面板", action: hide)
+                    Button("上次查询错误") { showingQueryError = true }
+                        .disabled(model.lastQueryFailure == nil)
                     Divider()
                     Button("退出监控") { NSApp.terminate(nil) }
                 } label: {
@@ -99,10 +102,18 @@ struct MonitorView: View {
                 .help("活动物理网卡合计：\(model.system?.interfaces.joined(separator: ", ") ?? "等待采样")。排除回环和 VPN 虚拟接口，单位为字节/秒。")
 
             divider.padding(.top, 15).padding(.bottom, 10)
-            HStack(spacing: 5) {
-                Circle().fill(model.quotaIsStale ? Color.orange : monitorMuted).frame(width: 4, height: 4)
-                Text(model.quotaStatus).lineLimit(1)
+            HStack(alignment: .top, spacing: 5) {
+                Circle().fill(model.quotaIsStale ? Color.orange : monitorMuted).frame(width: 4, height: 4).padding(.top, 3)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.quotaStatus).lineLimit(1)
+                    Text(model.quotaDetailStatus).lineLimit(1)
+                }
                 Spacer(minLength: 0)
+                if model.lastQueryFailure != nil {
+                    Button { showingQueryError = true } label: {
+                        Image(systemName: "info.circle").font(.system(size: 12))
+                    }.buttonStyle(.plain).help("查看上次查询失败的时间和原因")
+                }
             }.font(.system(size: 9)).foregroundColor(monitorMuted)
                 .help(model.quotaError ?? model.system?.error ?? "系统资源每秒采样；额度每分钟刷新。拖动面板空白处可移动。")
         }
@@ -115,6 +126,11 @@ struct MonitorView: View {
                 .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(.white.opacity(0.10), lineWidth: 1))
         )
         .preferredColorScheme(.dark)
+        .alert("查询错误详情", isPresented: $showingQueryError) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(model.queryErrorDetails)
+        }
     }
 
     private var quotaColor: Color {

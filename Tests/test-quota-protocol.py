@@ -62,14 +62,22 @@ def fake_cli() -> int:
     def emit(message: dict) -> None:
         print(json.dumps(message), flush=True)
 
-    def fail(request_id: object) -> None:
+    def fail(request_id: object, *, code: int = -32603, data: dict | None = None) -> None:
+        error = {
+            "code": code,
+            "message": f"{PRIVATE_DIAGNOSTIC}: {EMAIL}",
+        }
+        if data is not None:
+            error["data"] = data
         emit({
             "id": request_id,
-            "error": {
-                "code": -32603,
-                "message": f"{PRIVATE_DIAGNOSTIC}: {EMAIL}",
-            },
+            "error": error,
         })
+
+    def notify_account_updated() -> None:
+        emit({"method": "account/updated", "params": {
+            "authMode": "chatgpt", "planType": "plus",
+        }})
 
     for line in sys.stdin:
         request = json.loads(line)
@@ -78,7 +86,7 @@ def fake_cli() -> int:
         method = request.get("method")
         request_id = request.get("id")
         if method == "initialize":
-            emit({"id": request_id, "result": {"userAgent": "SyntheticCodex/1.1.0"}})
+            emit({"id": request_id, "result": {"userAgent": "SyntheticCodexTests"}})
         elif method == "initialized":
             continue
         elif method == "account/read":
@@ -95,22 +103,50 @@ def fake_cli() -> int:
                 account = {"type": "apiKey"}
             else:
                 account = {"type": "chatgpt", "email": EMAIL, "planType": "plus"}
-                if account_reads > 1 and scenario == "silent_account_changed":
+                if account_reads > 1 and scenario in ["silent_account_changed", "account_changed"]:
                     account["email"] = CHANGED_EMAIL
                 if account_reads > 1 and scenario == "same_mask_account_changed":
                     account["email"] = SAME_MASK_EMAIL
-            emit({"id": request_id, "result": {
+            if account_reads > 1 and scenario == "benign_before_confirmation":
+                notify_account_updated()
+            response = {"id": request_id, "result": {
                 "account": account,
                 "requiresOpenaiAuth": scenario != "api_key",
-            }})
+            }}
+            if account_reads == 2 and scenario == "benign_after_confirmation":
+                notification = {"method": "account/updated", "params": {
+                    "authMode": "chatgpt", "planType": "plus",
+                }}
+                # One atomic pipe write exposes the late notification in the same
+                # input batch as id3; the client must confirm once more via id4.
+                batch = json.dumps(response) + "\n" + json.dumps(notification) + "\n"
+                os.write(sys.stdout.fileno(), batch.encode("utf-8"))
+            else:
+                emit(response)
         elif method == "account/rateLimits/read":
             if scenario == "quota_error":
                 fail(request_id)
                 continue
-            if scenario == "account_changed":
-                emit({"method": "account/updated", "params": {
-                    "authMode": "chatgpt", "planType": "pro",
-                }})
+            if scenario == "structured_auth_error":
+                fail(request_id, code=-32000, data={
+                    "httpStatusCode": 401,
+                    "detail": PRIVATE_DIAGNOSTIC,
+                    "email": EMAIL,
+                })
+                continue
+            if scenario == "rate_limited":
+                fail(request_id, code=429)
+                continue
+            if scenario == "unknown_rpc_error":
+                fail(request_id, code=-32071, data={
+                    "detail": PRIVATE_DIAGNOSTIC, "email": EMAIL,
+                })
+                continue
+            if scenario == "quota_eof":
+                print(f"{PRIVATE_DIAGNOSTIC}: {EMAIL}", file=sys.stderr, flush=True)
+                return 0
+            if scenario in ["account_changed", "benign_before_quota"]:
+                notify_account_updated()
             # Even after a switch, deliberately send the old reading. The client
             # must reject it instead of pairing it with a different identity.
             emit({"id": request_id, "result": weekly_limits()})
@@ -159,11 +195,14 @@ class QuotaProtocolTests(unittest.TestCase):
             requests = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()] if trace.exists() else []
             return completed, output, requests
 
-    def assert_requests(self, requests: list[dict], *, quota: bool, confirm: bool = False) -> None:
+    def assert_requests(self, requests: list[dict], *, quota: bool, confirm: bool = False,
+                        reconfirm: bool = False) -> None:
         expected = ["initialize", "initialized", "account/read"]
         if quota:
             expected.append("account/rateLimits/read")
         if confirm:
+            expected.append("account/read")
+        if reconfirm:
             expected.append("account/read")
         self.assertEqual([request.get("method") for request in requests], expected)
         for request in requests:
@@ -172,16 +211,17 @@ class QuotaProtocolTests(unittest.TestCase):
         request_ids = [request["id"] for request in requests if "id" in request]
         self.assertEqual(len(request_ids), len(set(request_ids)), "Request IDs must be unique")
 
-    def assert_failed_read(self, scenario: str, *, quota: bool, confirm: bool = False) -> None:
+    def assert_failed_read(self, scenario: str, *, quota: bool, confirm: bool = False) -> dict:
         completed, output, requests = self.probe(scenario)
         self.assertEqual(completed.returncode, 1)
         self.assertTrue(output.get("quotaError"))
         self.assertIsNone(output.get("account"), "Failed paired read must not publish account identity")
         self.assertFalse(output.get("weeklyQuota"), "Failed paired read must not publish quota")
         self.assert_requests(requests, quota=quota, confirm=confirm)
+        return output
 
-    def test_chatgpt_identity_is_masked_and_paired_with_weekly_quota(self) -> None:
-        completed, output, requests = self.probe("chatgpt")
+    def assert_successful_chatgpt_read(self, scenario: str, *, reconfirm: bool = False) -> None:
+        completed, output, requests = self.probe(scenario)
         self.assertEqual(completed.returncode, 0)
         self.assertNotIn("quotaError", output)
         self.assertEqual(output["account"], {
@@ -193,7 +233,19 @@ class QuotaProtocolTests(unittest.TestCase):
         self.assertEqual(len(output["weeklyQuota"]), 1)
         self.assertEqual(output["weeklyQuota"][0]["remainingPercent"], 73)
         self.assertEqual(output["weeklyQuota"][0]["id"], "codex.secondary")
-        self.assert_requests(requests, quota=True, confirm=True)
+        self.assert_requests(requests, quota=True, confirm=True, reconfirm=reconfirm)
+
+    def test_chatgpt_identity_is_masked_and_paired_with_weekly_quota(self) -> None:
+        self.assert_successful_chatgpt_read("chatgpt")
+
+    def test_same_account_notification_before_quota_does_not_fail(self) -> None:
+        self.assert_successful_chatgpt_read("benign_before_quota")
+
+    def test_same_account_notification_before_confirmation_does_not_fail(self) -> None:
+        self.assert_successful_chatgpt_read("benign_before_confirmation")
+
+    def test_same_account_notification_after_confirmation_triggers_reconfirmation(self) -> None:
+        self.assert_successful_chatgpt_read("benign_after_confirmation", reconfirm=True)
 
     def test_logged_out_account_does_not_query_or_publish_weekly_quota(self) -> None:
         completed, output, requests = self.probe("signed_out")
@@ -216,7 +268,7 @@ class QuotaProtocolTests(unittest.TestCase):
         self.assert_requests(requests, quota=False)
 
     def test_account_switch_rejects_old_account_quota(self) -> None:
-        self.assert_failed_read("account_changed", quota=True)
+        self.assert_failed_read("account_changed", quota=True, confirm=True)
 
     def test_silent_account_switch_is_caught_by_identity_confirmation(self) -> None:
         self.assert_failed_read("silent_account_changed", quota=True, confirm=True)
@@ -232,6 +284,29 @@ class QuotaProtocolTests(unittest.TestCase):
 
     def test_malformed_protocol_reply_fails_without_partial_data(self) -> None:
         self.assert_failed_read("malformed_json", quota=False)
+
+    def test_structured_401_is_classified_without_private_diagnostics(self) -> None:
+        output = self.assert_failed_read("structured_auth_error", quota=True)
+        self.assertEqual(output["quotaErrorShort"], "需要重新登录")
+        self.assertIs(output["quotaRetryable"], False)
+
+    def test_429_is_classified_without_private_diagnostics(self) -> None:
+        output = self.assert_failed_read("rate_limited", quota=True)
+        self.assertEqual(output["quotaErrorShort"], "请求过于频繁")
+        self.assertIs(output["quotaRetryable"], False)
+
+    def test_unknown_rpc_error_retains_only_stage_and_safe_numeric_code(self) -> None:
+        output = self.assert_failed_read("unknown_rpc_error", quota=True)
+        self.assertEqual(output["quotaErrorShort"], "额度读取失败")
+        self.assertIs(output["quotaRetryable"], True)
+        self.assertIn("额度读取", output["quotaError"])
+        self.assertIn("-32071", output["quotaError"])
+
+    def test_cli_eof_reports_the_interrupted_stage_without_stderr_leak(self) -> None:
+        output = self.assert_failed_read("quota_eof", quota=True)
+        self.assertEqual(output["quotaErrorShort"], "额度读取中断")
+        self.assertIs(output["quotaRetryable"], True)
+        self.assertIn("额度读取", output["quotaError"])
 
 
 def main() -> int:

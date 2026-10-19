@@ -47,6 +47,48 @@ struct QuotaReading {
 
 enum QuotaClientError: LocalizedError {
     case cliUnavailable, launchFailed, timedOut, cancelled, invalidResponse, serviceUnavailable, accountChanged
+    case authenticationRequired, requestRejected, rateLimited, networkUnavailable
+    case rpcFailed(stage: String, code: Int?)
+    case processExited(stage: String)
+
+    private static func stageName(_ stage: String) -> String {
+        switch stage {
+        case "init": return "初始化"
+        case "account": return "账户读取"
+        case "quota": return "额度读取"
+        case "confirm": return "账户确认"
+        default: return "额度查询"
+        }
+    }
+
+    var shortDescription: String {
+        switch self {
+        case .cliUnavailable: return "未找到 Codex"
+        case .launchFailed: return "Codex 启动失败"
+        case .timedOut: return "查询超时"
+        case .cancelled: return "已取消"
+        case .invalidResponse: return "数据无法识别"
+        case .serviceUnavailable: return "服务暂不可用"
+        case .accountChanged: return "账户已变化"
+        case .authenticationRequired: return "需要重新登录"
+        case .requestRejected: return "请求被拒绝"
+        case .rateLimited: return "请求过于频繁"
+        case .networkUnavailable: return "网络暂不可用"
+        case .rpcFailed(let stage, _): return Self.stageName(stage) + "失败"
+        case .processExited(let stage): return Self.stageName(stage) + "中断"
+        }
+    }
+
+    var shouldRetry: Bool {
+        switch self {
+        case .cliUnavailable, .cancelled, .invalidResponse, .authenticationRequired, .requestRejected, .rateLimited:
+            return false
+        case .rpcFailed(_, let code):
+            // Invalid request, unknown method and invalid params cannot heal on a fast retry.
+            return ![-32600, -32601, -32602].contains(code ?? 0)
+        default: return true
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -57,6 +99,14 @@ enum QuotaClientError: LocalizedError {
         case .invalidResponse: return "Codex 返回的额度数据无法识别。"
         case .serviceUnavailable: return "暂时无法获取额度，请检查 Codex 登录和网络连接。"
         case .accountChanged: return "查询期间账户已变化，请重新刷新。"
+        case .authenticationRequired: return "Codex 登录已失效或尚未登录，请在 Codex 中重新登录后刷新。"
+        case .requestRejected: return "Codex 拒绝了请求，请检查账户权限或客户端版本。"
+        case .rateLimited: return "Codex 请求过于频繁，请稍后再试。"
+        case .networkUnavailable: return "Codex 服务暂时无法连接，请检查网络或稍后重试。"
+        case .rpcFailed(let stage, let code):
+            let nextStep = shouldRetry ? "，请稍后重试。" : "，请检查 Codex 客户端版本或请求配置。"
+            return "Codex \(Self.stageName(stage))失败" + (code.map { "（RPC 代码 \($0)）" } ?? "（未返回错误代码）") + nextStep
+        case .processExited(let stage): return "Codex 子进程在\(Self.stageName(stage))时退出，请稍后重试。"
         }
     }
 }
@@ -141,6 +191,39 @@ final class QuotaClient {
         return AccountSummary(maskedEmail: type == "chatgpt" ? maskedEmail(account["email"]) : nil,
                               planName: type == "chatgpt" ? planName(account["planType"]) : nil,
                               authType: type)
+    }
+
+    /// Classify only structured status values. Server messages may contain private data.
+    static func classifyRPCError(_ value: Any, stage: String) -> QuotaClientError {
+        guard let error = value as? [String: Any] else { return .invalidResponse }
+        let code = integer(error["code"])
+        var statusObjects = [error]
+        if let data = error["data"] as? [String: Any] {
+            statusObjects.append(data)
+            for key in ["http", "response"] {
+                if let nested = data[key] as? [String: Any] { statusObjects.append(nested) }
+            }
+        }
+        let statusKeys = ["httpStatusCode", "httpStatus", "statusCode", "status", "http_status_code", "http_status"]
+        let status = statusObjects.lazy.flatMap { object in
+            statusKeys.compactMap { integer(object[$0], allowNumericString: true) }
+        }.first(where: { (400...599).contains($0) }) ?? code
+        switch status {
+        case 401: return .authenticationRequired
+        case 403: return .requestRejected
+        case 429: return .rateLimited
+        case 408: return .timedOut
+        case 502, 503, 504: return .networkUnavailable
+        case .some(let value) where (400...499).contains(value): return .requestRejected
+        default: return .rpcFailed(stage: stage, code: code)
+        }
+    }
+
+    private static func integer(_ value: Any?, allowNumericString: Bool = false) -> Int? {
+        if let number = number(value) { return Int(exactly: number) }
+        if allowNumericString, let string = value as? String, string.count == 3,
+           string.utf8.allSatisfy({ (48...57).contains($0) }) { return Int(string) }
+        return nil
     }
 
     private static func maskedEmail(_ value: Any?) -> String? {
@@ -315,13 +398,16 @@ private final class QuotaRequest {
         guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == 0 else {
             throw QuotaClientError.launchFailed
         }
+        var stage = "init"
         func send(_ message: [String: Any]) throws {
             var data = try JSONSerialization.data(withJSONObject: message)
             data.append(0x0A)
             do { try input.fileHandleForWriting.write(contentsOf: data) }
-            catch { throw QuotaClientError.serviceUnavailable }
+            catch {
+                throw process.isRunning ? QuotaClientError.serviceUnavailable : QuotaClientError.processExited(stage: stage)
+            }
         }
-        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.0"
+        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.1"
         try send(["id": 0, "method": "initialize", "params": ["clientInfo": [
             "name": "codex_pet_monitor", "title": "Codex Pet Monitor", "version": clientVersion
         ]]])
@@ -329,6 +415,8 @@ private final class QuotaRequest {
         var account: AccountSummary?
         var accountFingerprint: Data?
         var pendingReading: QuotaReading?
+        var confirmedReading: QuotaReading?
+        var confirmationID = 3
         var buffer = Data()
         var bytes = [UInt8](repeating: 0, count: 8192)
         while true {
@@ -348,7 +436,7 @@ private final class QuotaRequest {
                 if errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR { continue }
                 throw QuotaClientError.serviceUnavailable
             }
-            if count == 0 { throw QuotaClientError.serviceUnavailable }
+            if count == 0 { throw QuotaClientError.processExited(stage: stage) }
             buffer.append(contentsOf: bytes.prefix(count))
             guard buffer.count <= 1_048_576 else { throw QuotaClientError.invalidResponse }
             while let newline = buffer.firstIndex(of: 0x0A) {
@@ -358,20 +446,27 @@ private final class QuotaRequest {
                 guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
                     throw QuotaClientError.invalidResponse
                 }
-                if message["method"] as? String == "account/updated", account != nil {
-                    throw QuotaClientError.accountChanged
+                if message["method"] as? String == "account/updated" {
+                    // A notification can report a harmless plan/token refresh. Compare identities
+                    // instead. If it follows confirmation in this buffer, confirm once more.
+                    if confirmedReading != nil {
+                        confirmedReading = nil
+                        confirmationID += 1
+                        try send(["id": confirmationID, "method": "account/read", "params": ["refreshToken": false]])
+                    }
+                    continue
                 }
                 guard let id = message["id"] as? NSNumber,
                       CFGetTypeID(id) != CFBooleanGetTypeID() else { continue }
                 if id.intValue == 0 && !initialized {
-                    guard message["error"] == nil, message["result"] is [String: Any] else {
-                        throw QuotaClientError.serviceUnavailable
-                    }
+                    if let error = message["error"] { throw QuotaClient.classifyRPCError(error, stage: stage) }
+                    guard message["result"] is [String: Any] else { throw QuotaClientError.invalidResponse }
                     initialized = true
                     try send(["method": "initialized", "params": [:]])
+                    stage = "account"
                     try send(["id": 1, "method": "account/read", "params": ["refreshToken": false]])
                 } else if id.intValue == 1 && initialized && account == nil {
-                    guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
+                    if let error = message["error"] { throw QuotaClient.classifyRPCError(error, stage: stage) }
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
@@ -381,16 +476,18 @@ private final class QuotaRequest {
                         return QuotaReading(windows: [], receivedAt: Date(), account: identity)
                     }
                     accountFingerprint = try Self.identityFingerprint(result)
+                    stage = "quota"
                     try send(["id": 2, "method": "account/rateLimits/read"])
                 } else if id.intValue == 2 && initialized && pendingReading == nil, let account {
-                    guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
+                    if let error = message["error"] { throw QuotaClient.classifyRPCError(error, stage: stage) }
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
                     pendingReading = try QuotaClient.parse(result, account: account)
-                    try send(["id": 3, "method": "account/read", "params": ["refreshToken": false]])
-                } else if id.intValue == 3, let reading = pendingReading {
-                    guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
+                    stage = "confirm"
+                    try send(["id": confirmationID, "method": "account/read", "params": ["refreshToken": false]])
+                } else if id.intValue == confirmationID, let reading = pendingReading {
+                    if let error = message["error"] { throw QuotaClient.classifyRPCError(error, stage: stage) }
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
@@ -399,9 +496,12 @@ private final class QuotaRequest {
                           try Self.identityFingerprint(result) == accountFingerprint else {
                         throw QuotaClientError.accountChanged
                     }
-                    return reading
+                    confirmedReading = reading
                 }
             }
+            // Drain complete messages already received before accepting a confirmation.
+            // Changes after this snapshot still require the next scheduled refresh.
+            if let confirmedReading, buffer.isEmpty { return confirmedReading }
         }
     }
 
@@ -532,4 +632,31 @@ func runQuotaTests() throws {
             throw TestFailure(message: "Malformed account response accepted")
         } catch is QuotaClientError { }
     }
+
+    let authError = QuotaClient.classifyRPCError(["code": -32000, "data": ["httpStatusCode": 401]], stage: "account")
+    try check(authError.shortDescription == "需要重新登录" && !authError.shouldRetry, "Structured HTTP 401 requires sign-in without fast retry")
+    let forbidden = QuotaClient.classifyRPCError(["code": 403], stage: "quota")
+    try check(forbidden.shortDescription == "请求被拒绝" && !forbidden.shouldRetry, "Explicit rejection must not fast retry")
+    let rateLimited = QuotaClient.classifyRPCError(["code": 429], stage: "quota")
+    try check(rateLimited.shortDescription == "请求过于频繁" && !rateLimited.shouldRetry, "Rate limiting must not trigger fast retry")
+    let network = QuotaClient.classifyRPCError(["code": -32000, "data": ["response": ["status": "503"]]], stage: "quota")
+    try check(network.shortDescription == "网络暂不可用" && network.shouldRetry, "Explicit upstream unavailability is retryable")
+    let privateMarker = "do-not-display-synthetic-private-data"
+    let generic = QuotaClient.classifyRPCError(["code": -32603, "message": "401 unauthorized " + privateMarker], stage: "quota")
+    try check(generic.shortDescription == "额度读取失败" && generic.shouldRetry,
+              "JSON-RPC internal errors must not be guessed to be authentication failures")
+    try check(generic.localizedDescription.contains("-32603") && !generic.localizedDescription.contains(privateMarker),
+              "Diagnostics may reveal a numeric code, never a raw server message")
+    let unknown = QuotaClient.classifyRPCError(["code": -32071, "message": privateMarker, "data": ["email": "private@example.test"]], stage: privateMarker)
+    try check(unknown.shortDescription == "额度查询失败" && unknown.shouldRetry && !unknown.localizedDescription.contains(privateMarker),
+              "Unknown stage names and private RPC data must not be echoed")
+    let invalidRequest = QuotaClient.classifyRPCError(["code": -32602], stage: "init")
+    try check(!invalidRequest.shouldRetry, "Invalid JSON-RPC parameters do not benefit from fast retry")
+    let boolStatus = QuotaClient.classifyRPCError(["code": -32000, "data": ["httpStatusCode": true]], stage: "quota")
+    try check(boolStatus.shortDescription == "额度读取失败", "Boolean status must not become an HTTP code")
+    let exited = QuotaClientError.processExited(stage: "quota")
+    try check(exited.shortDescription == "额度读取中断" && exited.shouldRetry, "Process exit must retain a safe stage and permit retry")
+    try check(!QuotaClientError.cliUnavailable.shouldRetry && !QuotaClientError.invalidResponse.shouldRetry &&
+              !QuotaClientError.cancelled.shouldRetry && QuotaClientError.timedOut.shouldRetry &&
+              QuotaClientError.accountChanged.shouldRetry, "Retry policy must distinguish persistent and transient failures")
 }

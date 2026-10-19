@@ -41,6 +41,19 @@ enum MonitorFormat {
     }
 }
 
+protocol QuotaReadingClient: AnyObject {
+    func read(completion: @escaping (Result<QuotaReading, Error>) -> Void)
+    func cancel()
+}
+
+extension QuotaClient: QuotaReadingClient {}
+
+struct QueryFailureDetail {
+    let occurredAt: Date
+    let summary: String
+    let detail: String
+}
+
 final class MonitorModel: ObservableObject {
     @Published var system: SystemSnapshot?
     @Published var reading: QuotaReading?
@@ -49,12 +62,24 @@ final class MonitorModel: ObservableObject {
     @Published var now = Date()
     @Published var selectedBucket = "codex.primary"
     @Published var pinned = true
+    @Published private(set) var nextQuotaRetryAt: Date?
+    @Published private(set) var lastQueryFailure: QueryFailureDetail?
 
     private var sampler = SystemSampler()
-    private let quotaClient = QuotaClient()
+    private let quotaClient: QuotaReadingClient
+    private let clock: () -> Date
     private var systemTimer: Timer?
     private var quotaTimer: Timer?
     private var lastExpiredRefresh: Date?
+    private let retryDelays: [TimeInterval] = [3, 8]
+    private var retriesUsed = 0
+    private var requestGeneration = 0
+    private var acceptsRequests = true
+
+    init(quotaClient: QuotaReadingClient = QuotaClient(), clock: @escaping () -> Date = Date.init) {
+        self.quotaClient = quotaClient
+        self.clock = clock
+    }
 
     var quota: WeeklyQuota? {
         reading?.windows.first(where: { $0.id == selectedBucket }) ?? reading?.windows.first
@@ -87,7 +112,7 @@ final class MonitorModel: ObservableObject {
 
     var quotaStatus: String {
         if isRefreshing { return "正在核对账号与额度…" }
-        if quotaError != nil { return "查询失败 · 账号与额度待确认" }
+        if quotaError != nil { return lastQueryFailure?.summary ?? "查询失败" }
         if hasExpired { return "窗口已到期 · 等待服务器确认" }
         if reading?.account.authType == "signedOut" { return "未登录 Codex · 请先完成登录" }
         if let reading, !reading.account.supportsWeeklyQuota { return "当前登录方式不提供周额度" }
@@ -96,35 +121,81 @@ final class MonitorModel: ObservableObject {
         return "正在读取 Codex 额度…"
     }
 
+    var quotaDetailStatus: String {
+        if let deadline = nextQuotaRetryAt {
+            let seconds = max(0, Int(ceil(deadline.timeIntervalSince(now))))
+            return "\(seconds) 秒后自动重试（\(retriesUsed)/\(retryDelays.count)）"
+        }
+        if quotaError != nil { return "可手动刷新 · 详情见右侧信息按钮" }
+        return " "
+    }
+
+    var queryErrorDetails: String {
+        guard let failure = lastQueryFailure else { return "本次运行尚无查询错误。" }
+        let timestamp = MonitorFormat.resetDate.string(from: failure.occurredAt)
+        return "上次失败：\(timestamp)\n\n\(failure.detail)\n\n" +
+            (quotaError == nil ? "当前查询已恢复。" : "账号与额度暂不显示，以免误认旧账号数据。")
+    }
+
     func start() {
-        tick()
+        guard systemTimer == nil else { return }
+        acceptsRequests = true
         systemTimer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
-        quotaTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.refreshQuota() }
+        quotaTimer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in self?.refreshQuotaAutomatically() }
         if let systemTimer { RunLoop.main.add(systemTimer, forMode: .common) }
         if let quotaTimer { RunLoop.main.add(quotaTimer, forMode: .common) }
         refreshQuota()
+        tick()
     }
 
     func tick() {
-        now = Date()
+        guard acceptsRequests else { return }
         system = sampler.sample()
-        if hasExpired, let reset = quota?.resetsAt, lastExpiredRefresh != reset, !isRefreshing {
+        checkQuotaTimers()
+    }
+
+    // Uses the existing one-second timer, so retries cannot leave an extra timer
+    // running after stop(). The clock is injectable for deterministic tests.
+    func checkQuotaTimers() {
+        guard acceptsRequests else { return }
+        now = clock()
+        if let deadline = nextQuotaRetryAt, deadline <= now, !isRefreshing {
+            beginQuotaRequest(resetRetries: false)
+            return
+        }
+        if hasExpired, let reset = quota?.resetsAt, lastExpiredRefresh != reset,
+           !isRefreshing, nextQuotaRetryAt == nil {
             lastExpiredRefresh = reset
-            refreshQuota()
+            refreshQuotaAutomatically()
         }
     }
 
     func wake() {
+        guard acceptsRequests else { return }
         sampler = SystemSampler()
-        tick()
         refreshQuota()
+        tick()
     }
 
     func refreshQuota() {
-        guard !isRefreshing else { return }
+        beginQuotaRequest(resetRetries: true)
+    }
+
+    func refreshQuotaAutomatically() {
+        guard nextQuotaRetryAt == nil else { return }
+        beginQuotaRequest(resetRetries: true)
+    }
+
+    private func beginQuotaRequest(resetRetries: Bool) {
+        // Menu actions share this guard with the disabled refresh button.
+        guard acceptsRequests, !isRefreshing else { return }
+        if resetRetries { retriesUsed = 0 }
+        nextQuotaRetryAt = nil
         isRefreshing = true
+        requestGeneration += 1
+        let generation = requestGeneration
         quotaClient.read { [weak self] result in
-            guard let self else { return }
+            guard let self, self.acceptsRequests, self.requestGeneration == generation else { return }
             self.isRefreshing = false
             self.applyQuotaResult(result)
         }
@@ -136,17 +207,37 @@ final class MonitorModel: ObservableObject {
             // Publish identity and quota as a single snapshot from one CLI request.
             self.reading = reading
             self.quotaError = nil
+            self.nextQuotaRetryAt = nil
+            self.retriesUsed = 0
         case .failure(let error):
             // The login may have changed since the last success. Never present an
             // old account or its quota as the currently authenticated identity.
             self.reading = nil
-            self.quotaError = error.localizedDescription
+            // Unknown error payloads are never shown verbatim: they may contain
+            // server diagnostics or account data outside our safe classifications.
+            let safeError = error as? QuotaClientError ?? .serviceUnavailable
+            now = clock()
+            self.quotaError = safeError.localizedDescription
+            self.lastQueryFailure = QueryFailureDetail(occurredAt: now, summary: safeError.shortDescription,
+                                                       detail: safeError.localizedDescription)
+            if acceptsRequests, safeError.shouldRetry, retriesUsed < retryDelays.count {
+                nextQuotaRetryAt = now.addingTimeInterval(retryDelays[retriesUsed])
+                retriesUsed += 1
+            } else {
+                nextQuotaRetryAt = nil
+            }
         }
     }
 
     func stop() {
+        acceptsRequests = false
+        requestGeneration += 1
         systemTimer?.invalidate()
         quotaTimer?.invalidate()
+        systemTimer = nil
+        quotaTimer = nil
+        nextQuotaRetryAt = nil
+        isRefreshing = false
         quotaClient.cancel()
     }
 }
