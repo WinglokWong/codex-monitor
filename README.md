@@ -6,6 +6,15 @@
 
 这是独立的第三方工具，与 OpenAI 无隶属关系。可把面板放在 Codex 内置宠物旁边；不会自动跟随宠物移动。
 
+## 平台
+
+| 平台 | 版本与说明 |
+| --- | --- |
+| macOS | 根目录中的 Swift/AppKit 应用，当前正式版为 [v1.1.1](https://github.com/WinglokWong/codex-monitor/releases/tag/v1.1.1) |
+| Windows 10/11 x64 | 独立 C#/WPF 实现，参见 [Windows 使用与构建说明](Windows/README.md)；首个预览版为 [v1.2.0-beta.1](https://github.com/WinglokWong/codex-monitor/releases/tag/v1.2.0-beta.1) |
+
+下面介绍 macOS 版。Windows 版使用独立的 Windows 构建与测试流程，保留同样的账号、额度、资源监控和有限重试规则。
+
 ## 下载与安装
 
 从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.1-universal.dmg`，打开后将 **Codex Monitor.app** 拖入 **Applications**，再从应用程序目录启动。升级时先退出旧版，再用新版替换应用；面板位置和置顶设置会保留。

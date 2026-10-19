@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>CodexMonitor</AssemblyName>
+    <RootNamespace>CodexMonitor.Windows</RootNamespace>
+    <ApplicationIcon>../../Assets/AppIcon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Product>Codex Monitor</Product>
+    <Description>Codex account quota and system resource monitor</Description>
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../CodexMonitor.Core/CodexMonitor.Core.csproj" />
+    <Resource Include="../../Assets/AppIcon.png" Link="Assets/AppIcon.png" />
+    <Resource Include="../../Assets/AppIcon.ico" Link="Assets/AppIcon.ico" />
+  </ItemGroup>
+</Project>

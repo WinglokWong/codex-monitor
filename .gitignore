@@ -6,3 +6,8 @@ dist/
 *.dSYM/
 __pycache__/
 *.py[cod]
+**/bin/
+**/obj/
+.vs/
+*.user
+Windows/artifacts/
