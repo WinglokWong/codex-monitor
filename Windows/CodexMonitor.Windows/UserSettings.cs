@@ -11,11 +11,20 @@ internal sealed class UserSettings
     public int? Y { get; set; }
     public bool Pinned { get; set; } = true;
     public string? CliPath { get; set; }
+    public int AccountQueryIntervalMinutes { get; set; } = 1;
+    public int QuotaQueryIntervalMinutes { get; set; } = 1;
     private static string FilePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexMonitor", "settings.json");
     public static UserSettings Load()
     {
-        try { return JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(FilePath)) ?? new(); }
+        try { return FromJson(File.ReadAllText(FilePath)); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return new(); }
+    }
+    internal static UserSettings FromJson(string json)
+    {
+        var settings = JsonSerializer.Deserialize<UserSettings>(json) ?? new();
+        if (settings.AccountQueryIntervalMinutes is < 1 or > 10080) settings.AccountQueryIntervalMinutes = 1;
+        if (settings.QuotaQueryIntervalMinutes is < 1 or > 10080) settings.QuotaQueryIntervalMinutes = 1;
+        return settings;
     }
     public void Save()
     {

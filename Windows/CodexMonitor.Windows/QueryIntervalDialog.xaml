@@ -1,0 +1,32 @@
+<Window x:Class="CodexMonitor.Windows.QueryIntervalDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="查询间隔" Width="420" SizeToContent="Height" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False"
+        Background="#171F23" Foreground="#E9EFF1" FontFamily="Segoe UI, Microsoft YaHei UI">
+  <Window.Resources>
+    <Style TargetType="TextBox"><Setter Property="Padding" Value="7" /><Setter Property="FontSize" Value="14" /><Setter Property="Background" Value="#29343A" /><Setter Property="Foreground" Value="#E9EFF1" /><Setter Property="BorderBrush" Value="#56666C" /></Style>
+    <Style TargetType="Button"><Setter Property="Padding" Value="12,6" /><Setter Property="Margin" Value="5,0,0,0" /></Style>
+  </Window.Resources>
+  <StackPanel Margin="22" Background="#171F23">
+    <TextBlock Text="查询间隔" FontSize="18" FontWeight="SemiBold" />
+    <TextBlock Text="账号和周额度分别设置，默认均为 1 分钟。" FontSize="12" Foreground="#A1ADB3" Margin="0,8,0,18" />
+    <Grid Margin="0,0,0,12"><Grid.ColumnDefinitions><ColumnDefinition Width="100" /><ColumnDefinition Width="*" /><ColumnDefinition Width="40" /></Grid.ColumnDefinitions>
+      <TextBlock Text="账号查询" VerticalAlignment="Center" />
+      <TextBox x:Name="AccountInput" Grid.Column="1" TextChanged="InputChanged" AutomationProperties.Name="账号查询间隔" />
+      <TextBlock Grid.Column="2" Text="分钟" Margin="8,0,0,0" VerticalAlignment="Center" />
+    </Grid>
+    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="100" /><ColumnDefinition Width="*" /><ColumnDefinition Width="40" /></Grid.ColumnDefinitions>
+      <TextBlock Text="周额度查询" VerticalAlignment="Center" />
+      <TextBox x:Name="QuotaInput" Grid.Column="1" TextChanged="InputChanged" AutomationProperties.Name="周额度查询间隔" />
+      <TextBlock Grid.Column="2" Text="分钟" Margin="8,0,0,0" VerticalAlignment="Center" />
+    </Grid>
+    <TextBlock x:Name="ValidationText" Foreground="#A1ADB3" FontSize="11" TextWrapping="Wrap" Margin="0,12,0,0" />
+    <TextBlock Text="周额度查询仍会核对账号身份，以免数据配错。系统资源保持每秒刷新，手动刷新与故障重试不受上述间隔限制。" Foreground="#A1ADB3" FontSize="11" TextWrapping="Wrap" Margin="0,12,0,20" />
+    <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+      <Button Content="恢复默认" Click="RestoreDefaults" HorizontalAlignment="Left" Margin="0" />
+      <Button Grid.Column="1" Content="取消" IsCancel="True" />
+      <Button x:Name="SaveButton" Grid.Column="2" Content="保存" Click="SaveClicked" IsDefault="True" />
+    </Grid>
+  </StackPanel>
+</Window>

@@ -25,7 +25,7 @@ public partial class MainWindow : Window
     {
         this.preview = preview;
         settings = preview ? new UserSettings() : UserSettings.Load();
-        ViewModel = model ?? new MonitorViewModel(new QuotaClient(settings.CliPath));
+        ViewModel = model ?? new MonitorViewModel(new QuotaClient(settings.CliPath), settings.AccountQueryIntervalMinutes, settings.QuotaQueryIntervalMinutes);
         InitializeComponent();
         DataContext = ViewModel;
         Topmost = settings.Pinned;
@@ -65,6 +65,7 @@ public partial class MainWindow : Window
         menu.Items.Add("保持置顶", null, (_, _) => Dispatcher.Invoke(TogglePinned));
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("选择 Codex CLI…", null, (_, _) => Dispatcher.Invoke(ChooseCli));
+        menu.Items.Add("查询间隔…", null, (_, _) => Dispatcher.Invoke(ConfigureQueryIntervals));
         menu.Items.Add("上次查询错误", null, (_, _) => Dispatcher.Invoke(ShowError));
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("退出监控", null, (_, _) => Dispatcher.Invoke(Quit));
@@ -120,6 +121,8 @@ public partial class MainWindow : Window
     private void MenuClicked(object sender, RoutedEventArgs args)
     {
         var menu = new System.Windows.Controls.ContextMenu();
+        Add("查询间隔…", ConfigureQueryIntervals);
+        menu.Items.Add(new Separator());
         Add("显示/隐藏置顶", TogglePinned, true, Topmost);
         Add("隐藏面板", HidePanel);
         Add("选择 Codex CLI…", ChooseCli);
@@ -140,6 +143,15 @@ public partial class MainWindow : Window
     {
         var dialog = new Microsoft.Win32.OpenFileDialog { Title = "选择已安装的 Codex CLI", Filter = "Codex CLI|*.exe;*.cmd|所有文件|*.*", CheckFileExists = true };
         if (dialog.ShowDialog(this) == true) SetCli(dialog.FileName);
+    }
+    private void ConfigureQueryIntervals()
+    {
+        var dialog = new QueryIntervalDialog(ViewModel.State.AccountIntervalMinutes, ViewModel.State.QuotaIntervalMinutes)
+        { Owner = this, Topmost = Topmost };
+        if (dialog.ShowDialog() != true || !ViewModel.State.SetQueryIntervals(dialog.AccountMinutes, dialog.QuotaMinutes)) return;
+        settings.AccountQueryIntervalMinutes = dialog.AccountMinutes;
+        settings.QuotaQueryIntervalMinutes = dialog.QuotaMinutes;
+        if (!preview) settings.Save();
     }
     private void SetCli(string? path)
     {

@@ -78,13 +78,45 @@ public partial class App : WpfApplication
         encoder.Frames.Add(BitmapFrame.Create(bitmap));
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
         using (var file = File.Create(outputPath)) encoder.Save(file);
-        File.WriteAllText(outputPath + ".json", JsonSerializer.Serialize(new { width = window.ActualWidth, height = window.ActualHeight, shown = true, restored = true, syntheticData = true }));
+        bool intervalDialogPassed = false;
+        Exception? intervalDialogError = null;
+        var dialog = new QueryIntervalDialog(2, 7) { Owner = window };
+        dialog.ContentRendered += (_, _) => dialog.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                var content = (FrameworkElement)dialog.Content;
+                content.UpdateLayout();
+                var picture = new RenderTargetBitmap((int)Math.Ceiling(content.ActualWidth * 2), (int)Math.Ceiling(content.ActualHeight * 2), 192, 192, PixelFormats.Pbgra32);
+                picture.Render(content);
+                var png = new PngBitmapEncoder();
+                png.Frames.Add(BitmapFrame.Create(picture));
+                using (var image = File.Create(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(outputPath))!, "ui-intervals.png"))) png.Save(image);
+                intervalDialogPassed = dialog.ExerciseValidationForSmoke();
+                if (!intervalDialogPassed) dialog.Close();
+            }
+            catch (Exception error) { intervalDialogError = error; dialog.Close(); }
+        }));
+        if (dialog.ShowDialog() != true || !intervalDialogPassed || intervalDialogError is not null)
+            throw new InvalidOperationException("Query interval dialog failed validation/save checks.", intervalDialogError);
+        var persisted = UserSettings.FromJson(JsonSerializer.Serialize(new UserSettings { AccountQueryIntervalMinutes = 2, QuotaQueryIntervalMinutes = 7 }));
+        if (persisted.AccountQueryIntervalMinutes != 2 || persisted.QuotaQueryIntervalMinutes != 7)
+            throw new InvalidOperationException("Query interval preference round-trip failed.");
+        var migrated = UserSettings.FromJson("{\"Pinned\":false,\"AccountQueryIntervalMinutes\":0,\"QuotaQueryIntervalMinutes\":10081}");
+        if (migrated.Pinned || migrated.AccountQueryIntervalMinutes != 1 || migrated.QuotaQueryIntervalMinutes != 1)
+            throw new InvalidOperationException("Invalid query interval preference fallback failed.");
+        File.WriteAllText(outputPath + ".json", JsonSerializer.Serialize(new { width = window.ActualWidth, height = window.ActualHeight, shown = true, restored = true, syntheticData = true, intervalDialog = intervalDialogPassed, intervalPreferences = true }));
         vm.State.Stop();
         window.Close();
     }
 
     private sealed class PreviewQuotaClient : IQuotaClient
     {
+        public async Task<QuotaReading> ReadAccountAsync(CancellationToken cancellationToken)
+        {
+            var reading = await ReadAsync(cancellationToken);
+            return reading with { Windows = Array.Empty<WeeklyQuota>() };
+        }
         public Task<QuotaReading> ReadAsync(CancellationToken cancellationToken)
         {
             var now = DateTimeOffset.UtcNow;

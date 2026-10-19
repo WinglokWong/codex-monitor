@@ -6,8 +6,8 @@
   <key>CFBundleName</key><string>Codex Monitor</string>
   <key>CFBundleDisplayName</key><string>Codex Monitor</string>
   <key>CFBundleExecutable</key><string>CodexMonitor</string>
-  <key>CFBundleVersion</key><string>3</string>
-  <key>CFBundleShortVersionString</key><string>1.1.1</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleShortVersionString</key><string>1.2.0</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>

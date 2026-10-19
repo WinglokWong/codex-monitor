@@ -156,7 +156,7 @@ def fake_cli() -> int:
 
 
 class QuotaProtocolTests(unittest.TestCase):
-    def probe(self, scenario: str) -> tuple[subprocess.CompletedProcess, dict, list[dict]]:
+    def probe(self, scenario: str, *, account_only: bool = False) -> tuple[subprocess.CompletedProcess, dict, list[dict]]:
         self.assertTrue(BINARY.is_file(), f"Build the monitor first: {BINARY}")
         with tempfile.TemporaryDirectory(prefix="codex-monitor-protocol-") as directory:
             temporary = Path(directory)
@@ -178,7 +178,7 @@ class QuotaProtocolTests(unittest.TestCase):
                 "CODEX_MONITOR_PROTOCOL_TRACE": str(trace),
             })
             completed = subprocess.run(
-                [str(BINARY), "--probe"],
+                [str(BINARY), "--account-probe" if account_only else "--probe"],
                 env=environment,
                 text=True,
                 capture_output=True,
@@ -237,6 +237,13 @@ class QuotaProtocolTests(unittest.TestCase):
 
     def test_chatgpt_identity_is_masked_and_paired_with_weekly_quota(self) -> None:
         self.assert_successful_chatgpt_read("chatgpt")
+
+    def test_account_only_query_never_reads_quota(self) -> None:
+        completed, output, requests = self.probe("chatgpt", account_only=True)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(output["account"]["maskedEmail"], MASKED_EMAIL)
+        self.assertEqual(output["weeklyQuota"], [])
+        self.assert_requests(requests, quota=False)
 
     def test_same_account_notification_before_quota_does_not_fail(self) -> None:
         self.assert_successful_chatgpt_read("benign_before_quota")

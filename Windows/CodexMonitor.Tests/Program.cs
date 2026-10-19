@@ -19,10 +19,17 @@ internal static class Program
             await RunAsync("stop cancels and suppresses late completion", TestStopAsync);
             await RunAsync("expiry and overlapping requests", TestExpiryAndOverlapAsync);
             await RunAsync("non-retryable failures", TestNonRetryableAsync);
+            await RunAsync("independent asymmetric query intervals", TestIndependentIntervalsAsync);
+            await RunAsync("interval validation and changes during requests", TestIntervalChangesAsync);
+            await RunAsync("independent retry schedules", TestIndependentRetriesAsync);
+            await RunAsync("account identity changes invalidate old quota", TestAccountIdentityAsync);
+            await RunAsync("stop suppresses account-only completions", TestAccountStopAsync);
             foreach (string scenario in new[] { "chatgpt", "benign_before_quota", "benign_before_confirmation", "benign_after_confirmation",
                 "signed_out", "api_key", "account_changed", "silent_account_changed", "same_mask_account_changed", "account_error",
                 "quota_error", "malformed_json", "structured_auth_error", "rate_limited", "unknown_rpc_error", "quota_eof" })
                 await RunAsync("synthetic protocol: " + scenario, () => TestProtocolAsync(scenario));
+            foreach (string scenario in new[] { "chatgpt", "signed_out", "api_key", "account_error" })
+                await RunAsync("account-only protocol: " + scenario, () => TestProtocolAsync(scenario, accountOnly: true));
             await RunAsync("system metric counter self-tests", RunMetricTestsAsync);
             if (OperatingSystem.IsWindows()) await RunAsync("native Windows system metrics", RunNativeMetricSmokeAsync);
             Console.WriteLine($"PASS: {_passed} test groups. No real Codex login or model calls used.");
@@ -58,7 +65,10 @@ internal static class Program
         """));
 
     private static QuotaReading Reading(DateTimeOffset at, DateTimeOffset? reset = null) =>
-        new([new WeeklyQuota("codex.secondary", "Codex", 27, reset ?? at.AddDays(7))], at, Account);
+        new([new WeeklyQuota("codex.secondary", "Codex", 27, reset ?? at.AddDays(7))], at, Account, "synthetic-identity-A");
+
+    private static QuotaReading AccountReading(DateTimeOffset at, string? identityKey = "synthetic-identity-A") =>
+        new([], at, Account, identityKey);
 
     private static Task TestParsingAsync()
     {
@@ -69,6 +79,8 @@ internal static class Program
         Require(reading.Windows.Count == 1 && reading.Windows[0].RemainingPercent == 73, "Weekly quota selection or remaining usage");
         Require(reading.Windows[0].ResetsAt == Synthetic.Epoch && reading.ReceivedAt == Synthetic.Epoch, "Unix timestamp units");
         AssertPrivateDataAbsent(JsonSerializer.Serialize(reading));
+        Require(!JsonSerializer.Serialize(reading with { IdentityKey = "private-identity-key" }).Contains("private-identity-key", StringComparison.Ordinal),
+            "Identity key must never be serialized");
         foreach (string invalidUsage in new[] { "true", "null", "\"12\"" })
         {
             var invalid = Json("{\"rateLimits\":{\"secondary\":{\"windowDurationMins\":10080,\"usedPercent\":" + invalidUsage + "}}}");
@@ -194,13 +206,168 @@ internal static class Program
         }
     }
 
+    private static async Task TestIndependentIntervalsAsync()
+    {
+        var clock = new FakeClock();
+        var client = new QueueClient();
+        QuotaReading original = Reading(clock.Now);
+        client.Succeed(original);
+        client.Succeed(Reading(clock.Now.AddMinutes(5)));
+        for (int minute = 1; minute <= 4; minute++) client.SucceedAccount(AccountReading(clock.Now.AddMinutes(minute)));
+        var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 5);
+        await state.RefreshAsync();
+        for (int second = 60; second <= 240; second += 60) await TickAsync(state, clock, second);
+        Require(client.AccountCalls == 4 && client.QuotaCalls == 1, "Fast account interval must not query quota");
+        Require(ReferenceEquals(state.Reading, original) && !state.IsStale, "Same identity account reads must preserve the quota and its longer freshness interval");
+        await TickAsync(state, clock, 300);
+        Require(client.AccountCalls == 4 && client.QuotaCalls == 2, "Simultaneously due queries must coalesce into one quota request");
+        Require(state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(360) && state.NextQuotaQueryAt == Synthetic.Epoch.AddSeconds(600), "Coalesced schedules must advance independently");
+        state.Stop();
+
+        clock = new FakeClock();
+        client = new QueueClient();
+        for (int minute = 0; minute <= 5; minute++) client.Succeed(Reading(clock.Now.AddMinutes(minute)));
+        state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 5, quotaIntervalMinutes: 1);
+        await state.RefreshAsync();
+        for (int second = 60; second <= 240; second += 60)
+        {
+            await TickAsync(state, clock, second);
+            Require(state.NextAccountQueryAt == Synthetic.Epoch.AddMinutes(5), "Quota verification must not postpone a future account deadline");
+        }
+        await TickAsync(state, clock, 300);
+        Require(client.QuotaCalls == 6 && client.AccountCalls == 0 && state.NextAccountQueryAt == Synthetic.Epoch.AddMinutes(10), "Reverse asymmetric intervals did not coalesce correctly");
+        state.Stop();
+    }
+
+    private static async Task TestIntervalChangesAsync()
+    {
+        var clock = new FakeClock();
+        var client = new QueueClient();
+        var pending = new TaskCompletionSource<QuotaReading>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Add(_ => pending.Task);
+        var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 5);
+        Require(!state.SetQueryIntervals(0, 5) && !state.SetQueryIntervals(1, 10081) && !state.SetQueryIntervals(-1, 2), "Invalid intervals must be rejected atomically");
+        Require(state.AccountIntervalMinutes == 1 && state.QuotaIntervalMinutes == 5, "Invalid settings changed live intervals");
+        Task refresh = state.RefreshAsync();
+        clock.Now = Synthetic.Epoch.AddSeconds(10);
+        Require(state.SetQueryIntervals(2, 5), "Valid interval change rejected");
+        Require(state.IsRefreshing && !client.LastToken.IsCancellationRequested, "Saving intervals must not cancel active work");
+        Require(state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(130) && state.NextQuotaQueryAt == Synthetic.Epoch.AddSeconds(300), "Only changed interval should be rescheduled from save time");
+        clock.Now = Synthetic.Epoch.AddSeconds(20);
+        pending.SetResult(Reading(clock.Now));
+        await refresh;
+        Require(state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(130), "Completion overwrote a setting saved during the request");
+        clock.Now = Synthetic.Epoch.AddSeconds(30);
+        Require(state.SetQueryIntervals(2, 5) && state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(130), "Saving unchanged values must not postpone queries");
+        Require(state.SetQueryIntervals(2, 10080), "Maximum valid quota interval was rejected");
+        Require(state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(130), "Changing only quota must not move account deadline");
+        state.Stop();
+    }
+
+    private static async Task TestIndependentRetriesAsync()
+    {
+        var clock = new FakeClock();
+        var client = new QueueClient();
+        client.Succeed(Reading(clock.Now));
+        for (int index = 0; index < 3; index++) client.FailAccount(QuotaErrorKind.NetworkUnavailable);
+        client.SucceedAccount(AccountReading(clock.Now.AddSeconds(181)));
+        var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 5);
+        await state.RefreshAsync();
+        await TickAsync(state, clock, 60);
+        Require(state.Account is null && state.Reading is null && state.NextAccountRetryAt == Synthetic.Epoch.AddSeconds(63)
+            && state.NextQuotaRetryAt is null, "Account failure must clear display and schedule only account retry");
+        clock.Now = Synthetic.Epoch.AddSeconds(61);
+        state.SetQueryIntervals(2, 5);
+        Require(state.NextAccountRetryAt == Synthetic.Epoch.AddSeconds(63) && state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(181), "Setting changes must preserve active retry deadlines");
+        await TickAsync(state, clock, 63);
+        Require(state.NextAccountRetryAt == Synthetic.Epoch.AddSeconds(71), "Independent account second retry must wait eight seconds");
+        await TickAsync(state, clock, 71);
+        Require(state.NextRetryAt is null && client.QuotaCalls == 1 && client.AccountCalls == 3, "Account retry exhaustion must not cause quota polling");
+        await TickAsync(state, clock, 181);
+        Require(state.Account == Account && state.Reading is null && state.NextQuotaQueryAt == Synthetic.Epoch.AddSeconds(300), "Account recovery must not restore old quota or move its deadline");
+        state.Stop();
+
+        // A successful quota query must not silently consume a future account retry.
+        clock = new FakeClock();
+        client = new QueueClient();
+        client.Succeed(Reading(clock.Now));
+        client.Succeed(Reading(clock.Now.AddSeconds(61)));
+        client.FailAccount(QuotaErrorKind.NetworkUnavailable);
+        client.SucceedAccount(AccountReading(clock.Now.AddSeconds(63)));
+        state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 2);
+        await state.RefreshAsync();
+        clock.Now = Synthetic.Epoch.AddSeconds(1);
+        state.SetQueryIntervals(1, 1); // Account at 60, quota at 61.
+        await TickAsync(state, clock, 60);
+        await TickAsync(state, clock, 61);
+        Require(state.Error is null && state.NextAccountRetryAt == Synthetic.Epoch.AddSeconds(63), "Quota success must preserve the account task's future retry");
+        await TickAsync(state, clock, 63);
+        Require(client.QuotaCalls == 2 && client.AccountCalls == 2 && state.NextRetryAt is null, "Pending account retry did not execute independently");
+        state.Stop();
+
+        // The inverse must hold as well: account success cannot consume a quota retry.
+        clock = new FakeClock();
+        client = new QueueClient();
+        client.Succeed(Reading(clock.Now));
+        client.Fail(QuotaErrorKind.NetworkUnavailable);
+        client.Succeed(Reading(clock.Now.AddSeconds(63)));
+        client.SucceedAccount(AccountReading(clock.Now.AddSeconds(62)));
+        state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 2, quotaIntervalMinutes: 1);
+        await state.RefreshAsync();
+        clock.Now = Synthetic.Epoch.AddSeconds(2);
+        state.SetQueryIntervals(1, 1); // Quota at 60, account at 62.
+        await TickAsync(state, clock, 60);
+        await TickAsync(state, clock, 62);
+        Require(state.NextQuotaRetryAt == Synthetic.Epoch.AddSeconds(63), "Account success must preserve the quota task's future retry");
+        await TickAsync(state, clock, 63);
+        Require(client.QuotaCalls == 3 && client.AccountCalls == 1 && state.NextAccountQueryAt == Synthetic.Epoch.AddSeconds(122), "Quota retry changed future account cadence");
+        state.Stop();
+    }
+
+    private static async Task TestAccountIdentityAsync()
+    {
+        foreach (string? nextIdentity in new string?[] { "synthetic-identity-B", null })
+        {
+            var clock = new FakeClock();
+            var client = new QueueClient();
+            client.Succeed(Reading(clock.Now));
+            client.SucceedAccount(AccountReading(clock.Now.AddMinutes(1), nextIdentity));
+            var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 10);
+            await state.RefreshAsync();
+            await TickAsync(state, clock, 60);
+            Require(state.Account?.MaskedEmail == Synthetic.MaskedEmail && state.Reading is null, "Same-mask changed or unknown identity must invalidate old quota");
+            Require(client.QuotaCalls == 1 && state.NextQuotaQueryAt == Synthetic.Epoch.AddMinutes(10), "Identity change must not trigger an early quota query");
+            state.Stop();
+        }
+    }
+
+    private static async Task TestAccountStopAsync()
+    {
+        var clock = new FakeClock();
+        var pending = new TaskCompletionSource<QuotaReading>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var client = new QueueClient();
+        client.Succeed(Reading(clock.Now));
+        client.AddAccount(_ => pending.Task);
+        var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 5);
+        await state.RefreshAsync();
+        clock.Now = Synthetic.Epoch.AddMinutes(1);
+        Task accountTask = state.TickAsync(clock.Now);
+        Require(state.ActiveQueryKind == "account", "Account-only in-flight kind is missing");
+        QuotaReading? previous = state.Reading;
+        state.Stop();
+        pending.SetResult(AccountReading(clock.Now, "synthetic-identity-B"));
+        await accountTask;
+        Require(client.LastToken.IsCancellationRequested && ReferenceEquals(state.Reading, previous)
+            && state.NextRetryAt is null && state.ActiveQueryKind is null, "Stopped account request published a late identity or retry");
+    }
+
     private static Task TickAsync(MonitorState state, FakeClock clock, int elapsedSeconds)
     {
         clock.Now = Synthetic.Epoch.AddSeconds(elapsedSeconds);
         return state.TickAsync(clock.Now);
     }
 
-    private static async Task TestProtocolAsync(string scenario)
+    private static async Task TestProtocolAsync(string scenario, bool accountOnly = false)
     {
         string executable = Path.ChangeExtension(typeof(Program).Assembly.Location, OperatingSystem.IsWindows() ? ".exe" : null);
         Require(File.Exists(executable), "Tests need their generated apphost, not the dotnet host");
@@ -217,19 +384,21 @@ internal static class Program
             QuotaReading? reading = null;
             QuotaException? failure = null;
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
-            try { reading = await client.ReadAsync(deadline.Token); }
+            try { reading = accountOnly ? await client.ReadAccountAsync(deadline.Token) : await client.ReadAsync(deadline.Token); }
             catch (QuotaException error) { failure = error; }
             bool success = scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation" or "signed_out" or "api_key";
             Require(success == (reading is not null && failure is null), "Unexpected protocol outcome: " + scenario);
             if (reading is not null)
             {
                 AssertPrivateDataAbsent(JsonSerializer.Serialize(reading));
+                Require(!string.IsNullOrEmpty(reading.IdentityKey), "Client reads must include an in-memory identity key");
+                Require(!JsonSerializer.Serialize(reading).Contains(reading.IdentityKey!, StringComparison.Ordinal), "Identity key leaked into JSON");
                 if (scenario is "signed_out" or "api_key")
                     Require(reading.Windows.Count == 0 && !reading.Account.SupportsWeeklyQuota && reading.Account.MaskedEmail is null,
                         "Unsupported login published old quota or identity");
                 else
                     Require(reading.Account.MaskedEmail == Synthetic.MaskedEmail && reading.Account.PlanName == "Plus"
-                        && reading.Windows.Count == 1 && reading.Windows[0].RemainingPercent == 73, "Identity/quota pairing failed");
+                        && (accountOnly ? reading.Windows.Count == 0 : reading.Windows.Count == 1 && reading.Windows[0].RemainingPercent == 73), "Identity/quota pairing failed");
             }
             if (failure is not null)
             {
@@ -244,17 +413,29 @@ internal static class Program
             var requests = File.ReadAllLines(trace).Select(Json).ToArray();
             var methods = requests.Select(item => item.GetProperty("method").GetString()).ToList();
             var expected = new List<string> { "initialize", "initialized", "account/read" };
-            bool quota = scenario is not ("signed_out" or "api_key" or "account_error" or "malformed_json");
-            bool confirm = scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation"
-                or "account_changed" or "silent_account_changed" or "same_mask_account_changed";
+            bool quota = !accountOnly && scenario is not ("signed_out" or "api_key" or "account_error" or "malformed_json");
+            bool confirm = !accountOnly && (scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation"
+                or "account_changed" or "silent_account_changed" or "same_mask_account_changed");
             if (quota) expected.Add("account/rateLimits/read");
             if (confirm) expected.Add("account/read");
-            if (scenario == "benign_after_confirmation") expected.Add("account/read");
+            if (!accountOnly && scenario == "benign_after_confirmation") expected.Add("account/read");
             Require(methods.SequenceEqual(expected), "Unexpected request sequence: " + scenario);
             foreach (var request in requests.Where(item => item.GetProperty("method").GetString() == "account/read"))
                 Require(!request.GetProperty("params").GetProperty("refreshToken").GetBoolean(), "Monitor must not force token refresh");
             var ids = requests.Where(item => item.TryGetProperty("id", out _)).Select(item => item.GetProperty("id").GetInt32()).ToArray();
             Require(ids.Distinct().Count() == ids.Length, "Request IDs must be unique");
+            if (accountOnly && scenario == "chatgpt")
+            {
+                // Separate calls must produce compatible identity keys, while two
+                // raw addresses with the same visible mask must remain distinct.
+                var full = await client.ReadAsync(deadline.Token);
+                Require(full.IdentityKey == reading!.IdentityKey, "Account-only and quota identity keys differ for the same account");
+                Environment.SetEnvironmentVariable("CODEX_MONITOR_TEST_SCENARIO", "same_mask_identity");
+                var switched = await client.ReadAccountAsync(deadline.Token);
+                Require(switched.Account == reading.Account && switched.IdentityKey != reading.IdentityKey,
+                    "Same-mask identities must produce distinct in-memory keys");
+                AssertPrivateDataAbsent(JsonSerializer.Serialize(switched));
+            }
         }
         finally
         {
@@ -288,17 +469,32 @@ internal static class Program
     private sealed class QueueClient : IQuotaClient
     {
         private readonly Queue<Func<CancellationToken, Task<QuotaReading>>> _responses = new();
+        private readonly Queue<Func<CancellationToken, Task<QuotaReading>>> _accountResponses = new();
         internal int Calls { get; private set; }
+        internal int QuotaCalls { get; private set; }
+        internal int AccountCalls { get; private set; }
         internal CancellationToken LastToken { get; private set; }
         internal void Add(Func<CancellationToken, Task<QuotaReading>> response) => _responses.Enqueue(response);
         internal void Succeed(QuotaReading reading) => Add(_ => Task.FromResult(reading));
         internal void Fail(QuotaErrorKind kind) => Add(_ => Task.FromException<QuotaReading>(new QuotaException(kind)));
+        internal void AddAccount(Func<CancellationToken, Task<QuotaReading>> response) => _accountResponses.Enqueue(response);
+        internal void SucceedAccount(QuotaReading reading) => AddAccount(_ => Task.FromResult(reading));
+        internal void FailAccount(QuotaErrorKind kind) => AddAccount(_ => Task.FromException<QuotaReading>(new QuotaException(kind, "account")));
         public Task<QuotaReading> ReadAsync(CancellationToken cancellationToken = default)
         {
             Calls++;
+            QuotaCalls++;
             LastToken = cancellationToken;
             Require(_responses.Count > 0, "Unexpected extra state request");
             return _responses.Dequeue()(cancellationToken);
+        }
+        public Task<QuotaReading> ReadAccountAsync(CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            AccountCalls++;
+            LastToken = cancellationToken;
+            Require(_accountResponses.Count > 0, "Unexpected extra account request");
+            return _accountResponses.Dequeue()(cancellationToken);
         }
     }
 }

@@ -62,6 +62,7 @@ internal static class FakeCli
                     string email = accountReads > 1 && (scenario is "account_changed" or "silent_account_changed")
                         ? Synthetic.ChangedEmail
                         : accountReads > 1 && scenario == "same_mask_account_changed" ? Synthetic.SameMaskEmail : Synthetic.Email;
+                    if (scenario == "same_mask_identity") email = Synthetic.SameMaskEmail;
                     account = new { type = "chatgpt", email, planType = "plus" };
                 }
                 object response = new { id, result = new { account, requiresOpenaiAuth = scenario != "api_key" } };

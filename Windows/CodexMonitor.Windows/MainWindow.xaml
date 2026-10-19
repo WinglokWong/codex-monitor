@@ -42,7 +42,7 @@
         <Grid.ColumnDefinitions><ColumnDefinition Width="22" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
         <Image Source="Assets/AppIcon.png" Width="19" Height="19" />
         <TextBlock Grid.Column="1" Text="C O D E X  M O N I T O R" FontSize="10" FontWeight="SemiBold" Foreground="{StaticResource Muted}" VerticalAlignment="Center" />
-        <Button Grid.Column="2" Content="↻" FontSize="17" Click="RefreshClicked" IsEnabled="{Binding CanRefresh}" ToolTip="刷新账号与额度" />
+        <Button Grid.Column="2" Content="↻" FontSize="17" Click="RefreshClicked" IsEnabled="{Binding CanRefresh}" ToolTip="{Binding RefreshTooltip}" />
         <Button Grid.Column="3" Content="•••" FontSize="11" Click="MenuClicked" ToolTip="面板菜单" />
       </Grid>
       <Border Background="#252E33" CornerRadius="9" Padding="10,8" Margin="0,0,0,16"

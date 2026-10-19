@@ -7,6 +7,7 @@ private let monitorMuted = Color(red: 0.59, green: 0.64, blue: 0.67)
 struct MonitorView: View {
     @ObservedObject var model: MonitorModel
     @State private var showingQueryError = false
+    @State private var showingQueryIntervals = false
     var hide: () -> Void
     var togglePinned: () -> Void
 
@@ -18,8 +19,11 @@ struct MonitorView: View {
                 Spacer()
                 Button(action: { model.refreshQuota() }) {
                     Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .medium))
-                }.buttonStyle(.plain).disabled(model.isRefreshing).help("刷新账号与额度（每分钟自动更新）")
+                }.buttonStyle(.plain).disabled(model.isRefreshing)
+                    .help("立即刷新账号与额度；账号每 \(model.accountIntervalMinutes) 分钟、周额度每 \(model.quotaIntervalMinutes) 分钟定时查询。")
                 Menu {
+                    Button("查询间隔…") { showingQueryIntervals = true }
+                    Divider()
                     Button(model.pinned ? "取消置顶" : "保持置顶", action: togglePinned)
                     Button("隐藏面板", action: hide)
                     Button("上次查询错误") { showingQueryError = true }
@@ -126,6 +130,7 @@ struct MonitorView: View {
                 .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(.white.opacity(0.10), lineWidth: 1))
         )
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showingQueryIntervals) { QueryIntervalSettingsView(model: model) }
         .alert("查询错误详情", isPresented: $showingQueryError) {
             Button("好", role: .cancel) {}
         } message: {

@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace CodexMonitor.Core;
 
@@ -27,11 +28,13 @@ public sealed record WeeklyQuota(string Id, string Label, double UsedPercent, Da
     public double RemainingPercent => Math.Clamp(100 - UsedPercent, 0, 100);
 }
 
-public sealed record QuotaReading(IReadOnlyList<WeeklyQuota> Windows, DateTimeOffset ReceivedAt, AccountSummary Account);
+public sealed record QuotaReading(IReadOnlyList<WeeklyQuota> Windows, DateTimeOffset ReceivedAt, AccountSummary Account,
+    [property: JsonIgnore] string? IdentityKey = null);
 
 public interface IQuotaClient
 {
     Task<QuotaReading> ReadAsync(CancellationToken cancellationToken);
+    Task<QuotaReading> ReadAccountAsync(CancellationToken cancellationToken);
 }
 
 public enum QuotaErrorKind
@@ -171,7 +174,11 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
     private const string ClientVersion = "1.2.0";
     private static readonly UTF8Encoding Utf8 = new(false, true);
 
-    public async Task<QuotaReading> ReadAsync(CancellationToken cancellationToken)
+    public Task<QuotaReading> ReadAsync(CancellationToken cancellationToken) => ReadInternalAsync(cancellationToken, accountOnly: false);
+
+    public Task<QuotaReading> ReadAccountAsync(CancellationToken cancellationToken) => ReadInternalAsync(cancellationToken, accountOnly: true);
+
+    private async Task<QuotaReading> ReadInternalAsync(CancellationToken cancellationToken, bool accountOnly)
     {
         cancellationToken.ThrowIfCancellationRequested();
         using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(20));
@@ -265,14 +272,18 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
                     {
                         var result = GetResult(message, stage);
                         account = ParseAccount(result);
-                        if (!account.SupportsWeeklyQuota) return new(Array.Empty<WeeklyQuota>(), DateTimeOffset.UtcNow, account);
                         identityFingerprint = Fingerprint(result);
+                        if (accountOnly || !account.SupportsWeeklyQuota)
+                            return new(Array.Empty<WeeklyQuota>(), DateTimeOffset.UtcNow, account, Convert.ToHexString(identityFingerprint));
                         stage = "quota";
                         await SendAsync(new { id = 2, method = "account/rateLimits/read" }).ConfigureAwait(false);
                     }
                     else if (id == 2 && initialized && account is not null && pendingReading is null)
                     {
-                        pendingReading = ParseQuota(GetResult(message, stage), account);
+                        pendingReading = ParseQuota(GetResult(message, stage), account) with
+                        {
+                            IdentityKey = Convert.ToHexString(identityFingerprint!)
+                        };
                         stage = "confirm";
                         await SendAsync(new { id = confirmationId, method = "account/read", @params = new { refreshToken = false } }).ConfigureAwait(false);
                     }
@@ -381,8 +392,8 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
     private static byte[] Fingerprint(JsonElement result)
     {
         result.TryGetProperty("account", out var account);
-        // A transient digest detects different emails even if they produce the same mask.
-        // Neither the original strings nor this digest are retained in QuotaReading.
+        // The in-memory digest distinguishes accounts that produce the same mask.
+        // Only that digest reaches QuotaReading; JsonIgnore prevents persistence/export.
         byte[] serialized = JsonSerializer.SerializeToUtf8Bytes(new
         {
             type = GetString(account, "type") ?? "signedOut",

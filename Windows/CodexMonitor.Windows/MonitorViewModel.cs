@@ -17,9 +17,9 @@ public sealed class MonitorViewModel : INotifyPropertyChanged
     public MonitorState State { get; private set; }
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public MonitorViewModel(IQuotaClient client)
+    public MonitorViewModel(IQuotaClient client, int accountIntervalMinutes = 1, int quotaIntervalMinutes = 1)
     {
-        State = new MonitorState(client);
+        State = new MonitorState(client, accountIntervalMinutes: accountIntervalMinutes, quotaIntervalMinutes: quotaIntervalMinutes);
         State.PropertyChanged += StateChanged;
     }
 
@@ -28,16 +28,18 @@ public sealed class MonitorViewModel : INotifyPropertyChanged
     public void SetSystem(SystemSnapshot value) { system = value; NotifyAll(); }
     public void ReplaceClient(IQuotaClient client)
     {
+        int accountInterval = State.AccountIntervalMinutes, quotaInterval = State.QuotaIntervalMinutes;
         State.PropertyChanged -= StateChanged;
         State.Stop();
-        State = new MonitorState(client);
+        State = new MonitorState(client, accountIntervalMinutes: accountInterval, quotaIntervalMinutes: quotaInterval);
         State.PropertyChanged += StateChanged;
         NotifyAll();
     }
 
     public bool CanRefresh => !State.IsRefreshing && !State.IsStopped;
-    public string AccountLabel => State.Reading?.Account.DisplayName ?? (State.Error is null ? "读取账号中…" : "账号待确认");
-    public string PlanLabel => State.IsRefreshing ? "核对中" : State.Reading?.Account.PlanName ?? "—";
+    public string AccountLabel => State.Account?.DisplayName ?? (State.Error is null ? "读取账号中…" : "账号待确认");
+    public string PlanLabel => State.IsRefreshing ? "核对中" : State.Account?.PlanName ?? "—";
+    public string RefreshTooltip => $"立即刷新账号与额度；账号每 {State.AccountIntervalMinutes} 分钟、周额度每 {State.QuotaIntervalMinutes} 分钟定时查询。";
     public string RemainingText => State.RemainingPercent is { } value ? value.ToString("0", CultureInfo.InvariantCulture) : "—";
     public double RemainingValue => State.RemainingPercent ?? 0;
     public string SyncLabel => State.IsRefreshing ? "核对中" : State.IsStale ? "待更新" : State.CurrentQuota is null ? "—" : "● 已同步";
@@ -72,16 +74,28 @@ public sealed class MonitorViewModel : INotifyPropertyChanged
     {
         get
         {
-            if (State.IsRefreshing) return "正在核对账号与额度…";
+            if (State.IsRefreshing) return State.ActiveQueryKind == "account" ? "正在查询账号…" : "正在查询周额度…";
             if (State.Error is not null) return State.LastFailure?.ShortDescription ?? "查询失败";
             if (State.HasExpired) return "窗口已到期 · 等待服务器确认";
-            if (State.Reading?.Account.AuthType == "signedOut") return "未登录 Codex · 请先完成登录";
-            if (State.Reading is { } reading && !reading.Account.SupportsWeeklyQuota) return "当前登录方式不提供周额度";
+            if (State.Account?.AuthType == "signedOut") return "未登录 Codex · 请先完成登录";
+            if (State.Account is { } account && !account.SupportsWeeklyQuota) return "当前登录方式不提供周额度";
+            if (State.Reading is null && State.Account is not null) return "账号已确认 · 等待周额度查询";
             if (State.Reading?.Windows.Count == 0) return "当前账号未返回周额度";
             return State.Reading is { } valid ? "额度更新于 " + TimeZoneInfo.ConvertTime(valid.ReceivedAt, Beijing).ToString("HH:mm:ss") : "正在读取 Codex 额度…";
         }
     }
-    public string DetailText => State.NextRetryAt is { } deadline ? $"{Math.Max(0, Math.Ceiling((deadline - State.Now).TotalSeconds)):0} 秒后自动重试（{State.RetryAttempt}/2）" : State.Error is not null ? "可手动刷新 · 右侧查看错误详情" : " ";
+    public string DetailText
+    {
+        get
+        {
+            if (State.NextRetryAt is { } deadline)
+            {
+                string kind = State.NextQuotaRetryAt == deadline ? "额度" : "账号";
+                return $"{Math.Max(0, Math.Ceiling((deadline - State.Now).TotalSeconds)):0} 秒后重试{kind}（{State.RetryAttempt}/2）";
+            }
+            return State.Error is not null ? "可手动刷新 · 右侧查看错误详情" : $"账号 {State.AccountIntervalMinutes} 分钟 · 额度 {State.QuotaIntervalMinutes} 分钟";
+        }
+    }
     public string ErrorDetails => State.LastFailure is { } failure
         ? "上次失败：" + (State.LastFailureAt is { } at ? BeijingDate(at) : "—") + "\n\n" + failure.Message + "\n\n" + (State.Error is null ? "当前查询已恢复。" : "暂不显示旧账号与额度，避免误认。")
         : "本次运行尚无查询错误。";

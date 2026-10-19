@@ -11,13 +11,19 @@ final class DraggableHostingView<Content: View>: NSHostingView<Content> {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
-    let model = MonitorModel()
+    let model: MonitorModel
     private var panel: MonitorPanel!
     private var statusItem: NSStatusItem!
     private var visibilityItem: NSMenuItem!
     private var pinItem: NSMenuItem!
     private var wakeObserver: NSObjectProtocol?
     private var screenObserver: NSObjectProtocol?
+
+    override init() {
+        let intervals = QueryIntervalPreferences.load()
+        model = MonitorModel(accountIntervalMinutes: intervals.accountMinutes, quotaIntervalMinutes: intervals.quotaMinutes)
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let otherInstances = NSRunningApplication.runningApplications(withBundleIdentifier: "local.winglok.codex-monitor")
@@ -195,14 +201,15 @@ func runAccountStateTests() throws {
     try check(model.remaining == nil && model.quotaStatus.contains("未登录"), "Signed-out state must not retain a previous balance")
 }
 
-func runProbe() -> Int32 {
+func runProbe(accountOnly: Bool = false) -> Int32 {
     let sampler = SystemSampler()
     _ = sampler.sample()
     Thread.sleep(forTimeInterval: 1)
     let sample = sampler.sample()
     let client = QuotaClient()
     var result: Result<QuotaReading, Error>?
-    client.read { result = $0 }
+    if accountOnly { client.readAccount { result = $0 } }
+    else { client.read { result = $0 } }
     let deadline = Date().addingTimeInterval(23)
     while result == nil && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.1)) }
     client.cancel()
@@ -246,11 +253,13 @@ if CommandLine.arguments.contains("--self-test") {
         try runFormatTests()
         try runAccountStateTests()
         try runRetryStateTests()
+        try runIntervalPreferenceTests()
         print("PASS: quota and account parsing, identity state, system counters, and display semantics")
         exit(0)
     } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--probe") { exit(runProbe()) }
+if CommandLine.arguments.contains("--account-probe") { exit(runProbe(accountOnly: true)) }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)

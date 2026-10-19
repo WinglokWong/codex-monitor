@@ -37,11 +37,14 @@ struct QuotaReading {
     let windows: [WeeklyQuota]
     let receivedAt: Date
     let account: AccountSummary
+    // In-memory identity comparison only. Never persist or include in diagnostic output.
+    let identityKey: String?
 
-    init(windows: [WeeklyQuota], receivedAt: Date, account: AccountSummary = .unavailable) {
+    init(windows: [WeeklyQuota], receivedAt: Date, account: AccountSummary = .unavailable, identityKey: String? = nil) {
         self.windows = windows
         self.receivedAt = receivedAt
         self.account = account
+        self.identityKey = identityKey
     }
 }
 
@@ -117,7 +120,15 @@ final class QuotaClient {
 
     /// Supersedes an outstanding read. Every completion, including cancellation, runs on main.
     func read(completion: @escaping (Result<QuotaReading, Error>) -> Void) {
-        let request = QuotaRequest(completion: completion)
+        begin(accountOnly: false, completion: completion)
+    }
+
+    func readAccount(completion: @escaping (Result<QuotaReading, Error>) -> Void) {
+        begin(accountOnly: true, completion: completion)
+    }
+
+    private func begin(accountOnly: Bool, completion: @escaping (Result<QuotaReading, Error>) -> Void) {
+        let request = QuotaRequest(accountOnly: accountOnly, completion: completion)
         lock.lock()
         let previous = activeRequest
         activeRequest = request
@@ -137,7 +148,7 @@ final class QuotaClient {
     deinit { cancel() }
 
     static func parse(_ result: [String: Any], receivedAt: Date = Date(),
-                      account: AccountSummary = .unavailable) throws -> QuotaReading {
+                      account: AccountSummary = .unavailable, identityKey: String? = nil) throws -> QuotaReading {
         var buckets: [(String, [String: Any])] = []
         if let multi = result["rateLimitsByLimitId"] as? [String: Any] {
             buckets = multi.compactMap { key, value in
@@ -174,7 +185,7 @@ final class QuotaClient {
                                            usedPercent: used, resetsAt: reset))
             }
         }
-        return QuotaReading(windows: windows, receivedAt: receivedAt, account: account)
+        return QuotaReading(windows: windows, receivedAt: receivedAt, account: account, identityKey: identityKey)
     }
 
     /// Returned identities retain only the masked email, never an account ID or token.
@@ -281,8 +292,10 @@ private final class QuotaRequest {
     private var cancelled = false
     private var completion: ((Result<QuotaReading, Error>) -> Void)?
     private var child: QuotaSubprocess?
+    private let accountOnly: Bool
 
-    init(completion: @escaping (Result<QuotaReading, Error>) -> Void) {
+    init(accountOnly: Bool, completion: @escaping (Result<QuotaReading, Error>) -> Void) {
+        self.accountOnly = accountOnly
         self.completion = completion
     }
 
@@ -407,7 +420,7 @@ private final class QuotaRequest {
                 throw process.isRunning ? QuotaClientError.serviceUnavailable : QuotaClientError.processExited(stage: stage)
             }
         }
-        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.1"
+        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2.0"
         try send(["id": 0, "method": "initialize", "params": ["clientInfo": [
             "name": "codex_pet_monitor", "title": "Codex Pet Monitor", "version": clientVersion
         ]]])
@@ -472,10 +485,12 @@ private final class QuotaRequest {
                     }
                     let identity = try QuotaClient.parseAccount(result)
                     account = identity
-                    guard identity.supportsWeeklyQuota else {
-                        return QuotaReading(windows: [], receivedAt: Date(), account: identity)
+                    let fingerprint = try Self.identityFingerprint(result)
+                    accountFingerprint = fingerprint
+                    let identityKey = fingerprint.map { String(format: "%02x", $0) }.joined()
+                    guard !accountOnly && identity.supportsWeeklyQuota else {
+                        return QuotaReading(windows: [], receivedAt: Date(), account: identity, identityKey: identityKey)
                     }
-                    accountFingerprint = try Self.identityFingerprint(result)
                     stage = "quota"
                     try send(["id": 2, "method": "account/rateLimits/read"])
                 } else if id.intValue == 2 && initialized && pendingReading == nil, let account {
@@ -483,7 +498,8 @@ private final class QuotaRequest {
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
-                    pendingReading = try QuotaClient.parse(result, account: account)
+                    let identityKey = accountFingerprint?.map { String(format: "%02x", $0) }.joined()
+                    pendingReading = try QuotaClient.parse(result, account: account, identityKey: identityKey)
                     stage = "confirm"
                     try send(["id": confirmationID, "method": "account/read", "params": ["refreshToken": false]])
                 } else if id.intValue == confirmationID, let reading = pendingReading {
@@ -506,7 +522,7 @@ private final class QuotaRequest {
     }
 
     /// A transient digest distinguishes even two emails with the same displayed mask.
-    /// Neither the original fields nor this digest leave the single query operation.
+    /// Only the digest may leave this operation, as an in-memory comparison key.
     private static func identityFingerprint(_ result: [String: Any]) throws -> Data {
         let identity = result["account"] as? [String: Any] ?? [:]
         let fields: [String: Any] = [
