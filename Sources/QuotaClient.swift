@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 import Darwin
 
 struct WeeklyQuota {
@@ -11,13 +12,41 @@ struct WeeklyQuota {
     var remainingPercent: Double { max(0, min(100, 100 - usedPercent)) }
 }
 
+struct AccountSummary: Equatable {
+    let maskedEmail: String?
+    let planName: String?
+    let authType: String
+
+    static let unavailable = AccountSummary(maskedEmail: nil, planName: nil, authType: "unavailable")
+
+    var displayName: String {
+        switch authType {
+        case "chatgpt": return maskedEmail ?? "ChatGPT（无邮箱）"
+        case "signedOut": return "未登录"
+        case "apiKey": return "API Key"
+        case "amazonBedrock": return "Amazon Bedrock"
+        case "unavailable": return "账户暂不可用"
+        default: return "其他认证方式"
+        }
+    }
+
+    var supportsWeeklyQuota: Bool { authType == "chatgpt" }
+}
+
 struct QuotaReading {
     let windows: [WeeklyQuota]
     let receivedAt: Date
+    let account: AccountSummary
+
+    init(windows: [WeeklyQuota], receivedAt: Date, account: AccountSummary = .unavailable) {
+        self.windows = windows
+        self.receivedAt = receivedAt
+        self.account = account
+    }
 }
 
 enum QuotaClientError: LocalizedError {
-    case cliUnavailable, launchFailed, timedOut, cancelled, invalidResponse, serviceUnavailable
+    case cliUnavailable, launchFailed, timedOut, cancelled, invalidResponse, serviceUnavailable, accountChanged
 
     var errorDescription: String? {
         switch self {
@@ -27,6 +56,7 @@ enum QuotaClientError: LocalizedError {
         case .cancelled: return "额度查询已取消。"
         case .invalidResponse: return "Codex 返回的额度数据无法识别。"
         case .serviceUnavailable: return "暂时无法获取额度，请检查 Codex 登录和网络连接。"
+        case .accountChanged: return "查询期间账户已变化，请重新刷新。"
         }
     }
 }
@@ -56,7 +86,8 @@ final class QuotaClient {
 
     deinit { cancel() }
 
-    static func parse(_ result: [String: Any], receivedAt: Date = Date()) throws -> QuotaReading {
+    static func parse(_ result: [String: Any], receivedAt: Date = Date(),
+                      account: AccountSummary = .unavailable) throws -> QuotaReading {
         var buckets: [(String, [String: Any])] = []
         if let multi = result["rateLimitsByLimitId"] as? [String: Any] {
             buckets = multi.compactMap { key, value in
@@ -93,7 +124,58 @@ final class QuotaClient {
                                            usedPercent: used, resetsAt: reset))
             }
         }
-        return QuotaReading(windows: windows, receivedAt: receivedAt)
+        return QuotaReading(windows: windows, receivedAt: receivedAt, account: account)
+    }
+
+    /// Returned identities retain only the masked email, never an account ID or token.
+    static func parseAccount(_ result: [String: Any]) throws -> AccountSummary {
+        guard let value = result["account"] else { throw QuotaClientError.invalidResponse }
+        if value is NSNull {
+            return AccountSummary(maskedEmail: nil, planName: nil, authType: "signedOut")
+        }
+        guard let account = value as? [String: Any],
+              let type = account["type"] as? String, !type.isEmpty, type.count <= 64,
+              type.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-" }) else {
+            throw QuotaClientError.invalidResponse
+        }
+        return AccountSummary(maskedEmail: type == "chatgpt" ? maskedEmail(account["email"]) : nil,
+                              planName: type == "chatgpt" ? planName(account["planType"]) : nil,
+                              authType: type)
+    }
+
+    private static func maskedEmail(_ value: Any?) -> String? {
+        guard let text = value as? String else { return nil }
+        let email = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pieces = email.split(separator: "@", omittingEmptySubsequences: false)
+        guard pieces.count == 2 else { return nil }
+        let local = String(pieces[0])
+        let domain = String(pieces[1])
+        let localCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.!#$%&'*+-/=?^_`{|}~")
+        let domainCharacters = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.")
+        let labels = domain.split(separator: ".", omittingEmptySubsequences: false)
+        guard !local.isEmpty, local.count <= 64, domain.count <= 253,
+              !local.hasPrefix("."), !local.hasSuffix("."), !local.contains(".."),
+              local.unicodeScalars.allSatisfy({ localCharacters.contains($0) }),
+              domain.unicodeScalars.allSatisfy({ domainCharacters.contains($0) }),
+              labels.count >= 2,
+              labels.allSatisfy({ !$0.isEmpty && $0.count <= 63 && !$0.hasPrefix("-") && !$0.hasSuffix("-") }) else {
+            return nil
+        }
+        let obscured = local.count >= 4
+            ? String(local.prefix(2)) + "***" + String(local.suffix(1))
+            : String(local.prefix(1)) + "***"
+        return obscured + "@" + domain
+    }
+
+    private static func planName(_ value: Any?) -> String? {
+        guard let text = value as? String else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 80,
+              !trimmed.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
+        let names = ["plus": "Plus", "pro": "Pro", "prolite": "Pro Lite", "pro_lite": "Pro Lite",
+                     "pro-lite": "Pro Lite", "pro lite": "Pro Lite", "team": "Team", "business": "Business",
+                     "enterprise": "Enterprise", "free": "Free"]
+        return names[trimmed.lowercased()] ?? trimmed
     }
 
     private static func number(_ value: Any?) -> Double? {
@@ -239,10 +321,14 @@ private final class QuotaRequest {
             do { try input.fileHandleForWriting.write(contentsOf: data) }
             catch { throw QuotaClientError.serviceUnavailable }
         }
+        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1.0"
         try send(["id": 0, "method": "initialize", "params": ["clientInfo": [
-            "name": "codex_pet_monitor", "title": "Codex Pet Monitor", "version": "1.0.0"
+            "name": "codex_pet_monitor", "title": "Codex Pet Monitor", "version": clientVersion
         ]]])
         var initialized = false
+        var account: AccountSummary?
+        var accountFingerprint: Data?
+        var pendingReading: QuotaReading?
         var buffer = Data()
         var bytes = [UInt8](repeating: 0, count: 8192)
         while true {
@@ -272,6 +358,9 @@ private final class QuotaRequest {
                 guard let message = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else {
                     throw QuotaClientError.invalidResponse
                 }
+                if message["method"] as? String == "account/updated", account != nil {
+                    throw QuotaClientError.accountChanged
+                }
                 guard let id = message["id"] as? NSNumber,
                       CFGetTypeID(id) != CFBooleanGetTypeID() else { continue }
                 if id.intValue == 0 && !initialized {
@@ -280,16 +369,53 @@ private final class QuotaRequest {
                     }
                     initialized = true
                     try send(["method": "initialized", "params": [:]])
-                    try send(["id": 1, "method": "account/rateLimits/read"])
-                } else if id.intValue == 1 && initialized {
+                    try send(["id": 1, "method": "account/read", "params": ["refreshToken": false]])
+                } else if id.intValue == 1 && initialized && account == nil {
                     guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
-                    return try QuotaClient.parse(result)
+                    let identity = try QuotaClient.parseAccount(result)
+                    account = identity
+                    guard identity.supportsWeeklyQuota else {
+                        return QuotaReading(windows: [], receivedAt: Date(), account: identity)
+                    }
+                    accountFingerprint = try Self.identityFingerprint(result)
+                    try send(["id": 2, "method": "account/rateLimits/read"])
+                } else if id.intValue == 2 && initialized && pendingReading == nil, let account {
+                    guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
+                    guard let result = message["result"] as? [String: Any] else {
+                        throw QuotaClientError.invalidResponse
+                    }
+                    pendingReading = try QuotaClient.parse(result, account: account)
+                    try send(["id": 3, "method": "account/read", "params": ["refreshToken": false]])
+                } else if id.intValue == 3, let reading = pendingReading {
+                    guard message["error"] == nil else { throw QuotaClientError.serviceUnavailable }
+                    guard let result = message["result"] as? [String: Any] else {
+                        throw QuotaClientError.invalidResponse
+                    }
+                    let confirmed = try QuotaClient.parseAccount(result)
+                    guard confirmed == account,
+                          try Self.identityFingerprint(result) == accountFingerprint else {
+                        throw QuotaClientError.accountChanged
+                    }
+                    return reading
                 }
             }
         }
+    }
+
+    /// A transient digest distinguishes even two emails with the same displayed mask.
+    /// Neither the original fields nor this digest leave the single query operation.
+    private static func identityFingerprint(_ result: [String: Any]) throws -> Data {
+        let identity = result["account"] as? [String: Any] ?? [:]
+        let fields: [String: Any] = [
+            "type": identity["type"] as? String ?? "signedOut",
+            "email": identity["email"] as? String ?? NSNull(),
+            "planType": identity["planType"] as? String ?? NSNull()
+        ]
+        let encoded = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
+        return Data(SHA256.hash(data: encoded))
     }
 }
 
@@ -364,4 +490,46 @@ func runQuotaTests() throws {
         _ = try QuotaClient.parse([:])
         throw TestFailure(message: "Malformed response accepted")
     } catch is QuotaClientError { }
+
+    let plus = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": "alice@example.com", "planType": "plus"]])
+    try check(plus.maskedEmail == "al***e@example.com" && plus.displayName == plus.maskedEmail,
+              "Account email must be masked before publishing")
+    try check(plus.planName == "Plus" && plus.supportsWeeklyQuota, "ChatGPT plan mapping")
+    let attributed = try QuotaClient.parse(multi, receivedAt: timestamp, account: plus)
+    try check(attributed.account == plus && attributed.windows.count == 2, "Identity must accompany its quota reading")
+    try check(reading.account == .unavailable, "Legacy quota parser must not invent identity")
+    for (email, expected) in [("a@example.com", "a***@example.com"),
+                              ("ab@example.com", "a***@example.com"),
+                              ("abc@example.com", "a***@example.com"),
+                              ("abcd@example.com", "ab***d@example.com")] {
+        let identity = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": email]])
+        try check(identity.maskedEmail == expected && identity.planName == nil, "Short emails and missing plans")
+    }
+    for invalid in ["", "not-an-email", "@example.com", "alice@", "a@@example.com", "a b@example.com",
+                    "alice@example..com", ".alice@example.com", "alice@-example.com"] {
+        let identity = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": invalid]])
+        try check(identity.maskedEmail == nil && identity.displayName == "ChatGPT（无邮箱）", "Malformed emails must not be displayed")
+    }
+    let missingEmail = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": NSNull(), "planType": NSNull()]])
+    try check(missingEmail.maskedEmail == nil && missingEmail.planName == nil, "Missing identity details remain unknown")
+    for (raw, expected) in [("plus", "Plus"), ("pro", "Pro"), ("prolite", "Pro Lite"),
+                            ("pro_lite", "Pro Lite"), ("team", "Team"), ("business", "Business"),
+                            ("enterprise", "Enterprise"), ("free", "Free"), (" future-plan ", "future-plan")] {
+        let identity = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "planType": raw]])
+        try check(identity.planName == expected, "Plan labels must derive from account/read")
+    }
+    let signedOut = try QuotaClient.parseAccount(["account": NSNull()])
+    try check(signedOut.authType == "signedOut" && !signedOut.supportsWeeklyQuota && signedOut.displayName == "未登录",
+              "Signed-out state must be explicit")
+    for type in ["apiKey", "amazonBedrock", "futureAuth"] {
+        let identity = try QuotaClient.parseAccount(["account": ["type": type, "email": "ignored@example.com", "planType": "pro"]])
+        try check(!identity.supportsWeeklyQuota && identity.authType == type && identity.maskedEmail == nil && identity.planName == nil,
+                  "Unsupported auth must not imply ChatGPT identity or quota")
+    }
+    for malformed in [[:], ["account": true], ["account": ["email": "alice@example.com"]]] as [[String: Any]] {
+        do {
+            _ = try QuotaClient.parseAccount(malformed)
+            throw TestFailure(message: "Malformed account response accepted")
+        } catch is QuotaClientError { }
+    }
 }

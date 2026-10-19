@@ -52,6 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 panel.setFrameOrigin(NSPoint(x: bounds.maxX - panel.frame.width - 30, y: bounds.minY + 90))
             }
         }
+        // Autosaved frames from earlier versions include the old content height.
+        // Preserve their top-left position while fitting the new account row.
+        let restoredTop = panel.frame.maxY
+        panel.setContentSize(host.fittingSize)
+        panel.setFrameOrigin(NSPoint(x: panel.frame.minX, y: restoredTop - panel.frame.height))
         panel.setFrameAutosaveName("CodexMonitorPanel")
         ensureVisible()
         buildStatusMenu()
@@ -171,6 +176,25 @@ func runFormatTests() throws {
     try check(MonitorFormat.resetDate.string(from: Date(timeIntervalSince1970: 1792981758)) == "10月26日 10:29", "Reset timestamp must use Asia/Shanghai")
 }
 
+func runAccountStateTests() throws {
+    func check(_ condition: Bool, _ message: String) throws {
+        if !condition { throw MonitorTestError(description: message) }
+    }
+    let model = MonitorModel()
+    let first = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": "alice@example.com", "planType": "plus"]])
+    let second = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": "bob@example.com", "planType": "pro"]])
+    let quota = WeeklyQuota(id: "codex.primary", label: "Codex", usedPercent: 20, resetsAt: nil)
+    model.applyQuotaResult(.success(QuotaReading(windows: [quota], receivedAt: Date(), account: first)))
+    try check(model.accountLabel == first.displayName && model.remaining == 80, "First account and quota must publish together")
+    model.applyQuotaResult(.failure(QuotaClientError.serviceUnavailable))
+    try check(model.reading == nil && model.remaining == nil && model.accountLabel == "账号待确认", "Failure must clear old identity and quota")
+    model.applyQuotaResult(.success(QuotaReading(windows: [], receivedAt: Date(), account: second)))
+    try check(model.accountLabel == second.displayName && model.remaining == nil && model.quotaError == nil, "Switching accounts must not reuse the first account's quota")
+    let signedOut = try QuotaClient.parseAccount(["account": NSNull()])
+    model.applyQuotaResult(.success(QuotaReading(windows: [], receivedAt: Date(), account: signedOut)))
+    try check(model.remaining == nil && model.quotaStatus.contains("未登录"), "Signed-out state must not retain a previous balance")
+}
+
 func runProbe() -> Int32 {
     let sampler = SystemSampler()
     _ = sampler.sample()
@@ -193,6 +217,12 @@ func runProbe() -> Int32 {
     var success = false
     switch result {
     case .success(let reading):
+        output["account"] = [
+            "authType": reading.account.authType,
+            "displayName": reading.account.displayName,
+            "maskedEmail": reading.account.maskedEmail as Any? ?? NSNull(),
+            "planName": reading.account.planName as Any? ?? NSNull()
+        ] as [String: Any]
         output["weeklyQuota"] = reading.windows.map { quota in
             ["id": quota.id, "remainingPercent": quota.remainingPercent,
              "resetsAt": quota.resetsAt.map { MonitorFormat.resetDate.string(from: $0) } as Any? ?? NSNull()] as [String: Any]
@@ -210,7 +240,8 @@ if CommandLine.arguments.contains("--self-test") {
         try runQuotaTests()
         try runSystemMetricTests()
         try runFormatTests()
-        print("PASS: quota parsing, system counter handling, and display semantics")
+        try runAccountStateTests()
+        print("PASS: quota and account parsing, identity state, system counters, and display semantics")
         exit(0)
     } catch { fputs("FAIL: \(error)\n", stderr); exit(1) }
 }

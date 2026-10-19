@@ -4,3 +4,5 @@ dist/
 .env
 .env.*
 *.dSYM/
+__pycache__/
+*.py[cod]

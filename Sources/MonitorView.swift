@@ -28,7 +28,24 @@ struct MonitorView: View {
                 }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("面板菜单")
             }
             .foregroundColor(monitorMuted)
-            .padding(.bottom, 19)
+            .padding(.bottom, 12)
+
+            HStack(spacing: 7) {
+                Image(systemName: "person.crop.circle").font(.system(size: 13)).foregroundColor(monitorMuted)
+                Text(model.accountLabel)
+                    .font(.system(size: 11, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Text(model.accountPlanLabel)
+                    .font(.system(size: 9, weight: .semibold)).lineLimit(1).truncationMode(.tail)
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .foregroundColor(monitorGreen)
+                    .background(Capsule().fill(monitorGreen.opacity(0.10)))
+                    .frame(maxWidth: 92, alignment: .trailing)
+            }
+            .padding(.horizontal, 9).padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 9).fill(Color.white.opacity(0.04)))
+            .padding(.bottom, 14)
+            .help("额度来自本机 Codex CLI 的登录账号。邮箱已脱敏；可在 Codex 中登录或切换账号后刷新。")
 
             HStack(alignment: .center) {
                 Text("本周剩余额度").font(.system(size: 12, weight: .medium))

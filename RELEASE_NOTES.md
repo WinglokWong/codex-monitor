@@ -1,16 +1,19 @@
-# Codex Monitor v1.0.0
+# Codex Monitor v1.1.0
 
-首个公开版本：在 Codex 桌面宠物旁放置一个可拖动、可置顶的独立监控面板。
+新增账户信息行，便于确认当前显示的是哪个 Codex CLI 账户的周额度。
 
-- 显示 Codex 剩余周额度、北京时间的重置时间和倒计时，每分钟自动刷新，也支持手动刷新。
-- 显示全系统 CPU、内存使用率，以及活动物理网卡的上传、下载速率，每秒更新。
-- 独立 Dock 图标与应用菜单；点击 Dock 图标恢复面板，支持快捷键刷新、显示和退出。
-- 通过面板菜单或菜单栏图标切换置顶、隐藏面板和退出；保存面板位置。
-- 额度读取失败或重置窗口到期时显示状态提示；缺失数据以“—”显示。
+- 显示脱敏邮箱与账户套餐，通过同一个本地 Codex CLI 的 `account/read` 和 `account/rateLimits/read` 查询账户及额度，每分钟自动刷新，也支持手动刷新。
+- 明确显示 API key 模式和未登录状态；邮箱缺失或为 `null` 时显示无邮箱信息。
+- 刷新失败时清空旧账户和旧额度，显示错误状态，避免切换登录后误认旧账户数据。
+- 原始邮箱仅在内存中处理，不持久化或提交到仓库；token 仍由 Codex 管理。账户自测使用虚构数据。
+
+未增加登录或切换账户界面。在现有 Codex CLI 中更换登录后，下一次成功刷新会显示新账户。CLI 与桌面应用使用不同登录时，以 CLI 当前账户为准。
+
+继续提供剩余周额度、北京时间重置倒计时，以及每秒更新的 CPU、内存、上传／下载速率。保留可拖动置顶面板、位置记忆、Dock 和菜单栏入口及快捷键。
 
 ## 下载与安装
 
-下载 `Codex-Monitor-1.0.0-universal.dmg`。支持 macOS 13 及更新版本，包含 Apple Silicon（arm64）和 Intel（x86_64）架构。
+从 [最新 GitHub Release](https://github.com/WinglokWong/codex-monitor/releases/latest) 下载 `Codex-Monitor-1.1.0-universal.dmg`。支持 macOS 13 及更新版本，包含 Apple Silicon（arm64）和 Intel（x86_64）架构。
 
 已在 macOS 26 / Apple Silicon 实机验证。Intel 二进制已构建，尚未在 Intel Mac 实机验证。
 

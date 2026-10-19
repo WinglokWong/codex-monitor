@@ -62,9 +62,18 @@ final class MonitorModel: ObservableObject {
 
     var hasExpired: Bool { quota?.resetsAt.map { $0 <= now } ?? false }
     var quotaIsStale: Bool {
-        quotaError != nil || hasExpired || (reading.map { now.timeIntervalSince($0.receivedAt) > 180 } ?? false)
+        isRefreshing || quotaError != nil || hasExpired || (reading.map { now.timeIntervalSince($0.receivedAt) > 180 } ?? false)
     }
     var remaining: Double? { hasExpired ? nil : quota?.remainingPercent }
+
+    var accountLabel: String {
+        reading?.account.displayName ?? (quotaError == nil ? "读取账号中…" : "账号待确认")
+    }
+
+    var accountPlanLabel: String {
+        if isRefreshing { return "核对中" }
+        return reading?.account.planName ?? "—"
+    }
 
     var memoryPercent: Double? {
         guard let system, let used = system.memoryUsedBytes, system.memoryTotalBytes > 0 else { return nil }
@@ -77,11 +86,11 @@ final class MonitorModel: ObservableObject {
     }
 
     var quotaStatus: String {
-        if isRefreshing { return "正在刷新额度…" }
-        if quotaError != nil {
-            return reading.map { "更新失败 · 上次成功 \(MonitorFormat.clock.string(from: $0.receivedAt))" } ?? "额度暂不可用 · 可点右上角重试"
-        }
+        if isRefreshing { return "正在核对账号与额度…" }
+        if quotaError != nil { return "查询失败 · 账号与额度待确认" }
         if hasExpired { return "窗口已到期 · 等待服务器确认" }
+        if reading?.account.authType == "signedOut" { return "未登录 Codex · 请先完成登录" }
+        if let reading, !reading.account.supportsWeeklyQuota { return "当前登录方式不提供周额度" }
         if let reading, reading.windows.isEmpty { return "当前账户未返回周额度" }
         if let reading { return "额度更新于 \(MonitorFormat.clock.string(from: reading.receivedAt))" }
         return "正在读取 Codex 额度…"
@@ -117,13 +126,21 @@ final class MonitorModel: ObservableObject {
         quotaClient.read { [weak self] result in
             guard let self else { return }
             self.isRefreshing = false
-            switch result {
-            case .success(let reading):
-                self.reading = reading
-                self.quotaError = nil
-            case .failure(let error):
-                self.quotaError = error.localizedDescription
-            }
+            self.applyQuotaResult(result)
+        }
+    }
+
+    func applyQuotaResult(_ result: Result<QuotaReading, Error>) {
+        switch result {
+        case .success(let reading):
+            // Publish identity and quota as a single snapshot from one CLI request.
+            self.reading = reading
+            self.quotaError = nil
+        case .failure(let error):
+            // The login may have changed since the last success. Never present an
+            // old account or its quota as the currently authenticated identity.
+            self.reading = nil
+            self.quotaError = error.localizedDescription
         }
     }
 
