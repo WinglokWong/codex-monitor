@@ -65,7 +65,7 @@
         <StackPanel Orientation="Horizontal"><TextBlock Text="{Binding RemainingText}" FontSize="46" FontWeight="SemiBold" /><TextBlock Text="%" FontSize="21" Foreground="{StaticResource Muted}" VerticalAlignment="Bottom" Margin="2,0,0,8" /></StackPanel>
         <TextBlock Text="{Binding SyncLabel}" FontSize="10" Foreground="{Binding SyncBrush}" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,0,10" />
       </Grid>
-      <ProgressBar Value="{Binding RemainingValue}" Foreground="{Binding QuotaBrush}" Height="5" />
+      <ProgressBar Value="{Binding RemainingValue, Mode=OneWay}" Foreground="{Binding QuotaBrush}" Height="5" />
       <Grid Margin="0,11,0,0"><TextBlock Text="{Binding ResetText}" FontSize="11" /><TextBlock Text="北京时间" Style="{StaticResource Caption}" HorizontalAlignment="Right" /></Grid>
       <TextBlock Text="{Binding CountdownText}" Style="{StaticResource Caption}" Margin="0,4,0,0" />
       <Border Height="1" Background="#303A3E" Margin="0,17" />
@@ -73,12 +73,12 @@
         <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="24" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
         <StackPanel>
           <Grid Margin="0,0,0,7"><TextBlock Text="CPU" Style="{StaticResource Caption}" VerticalAlignment="Center" /><TextBlock Text="{Binding CpuText}" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Right" /></Grid>
-          <ProgressBar Value="{Binding CpuValue}" />
+          <ProgressBar Value="{Binding CpuValue, Mode=OneWay}" />
           <TextBlock Text="{Binding CpuScope}" Style="{StaticResource Caption}" FontSize="10" Margin="0,6,0,0" />
         </StackPanel>
         <StackPanel Grid.Column="2" ToolTip="Windows 物理内存使用量：总量减可用量。">
           <Grid Margin="0,0,0,7"><TextBlock Text="内存" Style="{StaticResource Caption}" VerticalAlignment="Center" /><TextBlock Text="{Binding MemoryText}" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Right" /></Grid>
-          <ProgressBar Value="{Binding MemoryValue}" Foreground="#A1BDFF" />
+          <ProgressBar Value="{Binding MemoryValue, Mode=OneWay}" Foreground="#A1BDFF" />
           <TextBlock Text="{Binding MemoryDetail}" Style="{StaticResource Caption}" FontSize="10" Margin="0,6,0,0" />
         </StackPanel>
       </Grid>

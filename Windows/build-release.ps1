@@ -26,7 +26,10 @@ try {
     $start.ArgumentList.Add($renderPath)
     $process = [System.Diagnostics.Process]::Start($start)
     if (-not $process.WaitForExit(30000)) { $process.Kill($true); throw 'UI render smoke test timed out.' }
-    if ($process.ExitCode -ne 0 -or -not (Test-Path $renderPath)) { throw 'UI render smoke test failed.' }
+    if ($process.ExitCode -ne 0 -or -not (Test-Path $renderPath)) {
+        if (Test-Path "$renderPath.error.txt") { Get-Content "$renderPath.error.txt" | Write-Host }
+        throw 'UI render smoke test failed.'
+    }
     Copy-Item README.md (Join-Path $publish 'README-Windows.md')
     # Include the licenses shipped with the framework runtime packs we redistribute.
     $licenses = Join-Path $publish 'licenses'
