@@ -47,7 +47,8 @@ public sealed class MonitorState : INotifyPropertyChanged
         get => _selectedBucketId;
         set
         {
-            if (_selectedBucketId == value) return;
+            // WPF clears SelectedValue briefly while replacing ItemsSource.
+            if (string.IsNullOrWhiteSpace(value) || _selectedBucketId == value) return;
             _selectedBucketId = value;
             NotifyChanged();
         }
@@ -108,6 +109,8 @@ public sealed class MonitorState : INotifyPropertyChanged
             Now = _clock();
             // Identity and usage are published atomically from one confirmed read.
             Reading = reading;
+            if (!reading.Windows.Any(window => window.Id == _selectedBucketId))
+                _selectedBucketId = reading.Windows.FirstOrDefault()?.Id ?? "codex.primary";
             Error = null;
             NextRetryAt = null;
             RetryAttempt = 0;

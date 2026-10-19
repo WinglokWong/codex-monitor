@@ -130,6 +130,9 @@ internal static class Program
         await state.RefreshAsync();
         Require(state.Error is null && state.NextRetryAt is null && state.RetryAttempt == 0, "Manual recovery must clear retry/error state");
         Require(state.LastFailure == retained, "Last safe diagnostic must remain available after recovery");
+        Require(state.SelectedBucketId == "codex.secondary", "Selection must follow an available quota bucket after refresh");
+        state.SelectedBucketId = null!; // ItemsSource changes can clear WPF SelectedValue temporarily.
+        Require(state.SelectedBucketId == "codex.secondary", "Transient empty UI selection must not erase the active quota bucket");
         await TickAsync(state, clock, 3);
         Require(client.Calls == 3 && changes > 0, "Old retry must be canceled and changes must notify UI");
         state.Stop();
