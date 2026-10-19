@@ -204,6 +204,13 @@ final class QuotaClient {
                               authType: type)
     }
 
+    // A digest of an absent or invalid email cannot establish cross-query identity:
+    // two unrelated accounts may have the same auth type and plan.
+    fileprivate static func crossQueryIdentityKey(account: AccountSummary, fingerprint: Data) -> String? {
+        guard account.authType == "chatgpt", account.maskedEmail != nil else { return nil }
+        return fingerprint.map { String(format: "%02x", $0) }.joined()
+    }
+
     /// Classify only structured status values. Server messages may contain private data.
     static func classifyRPCError(_ value: Any, stage: String) -> QuotaClientError {
         guard let error = value as? [String: Any] else { return .invalidResponse }
@@ -487,7 +494,7 @@ private final class QuotaRequest {
                     account = identity
                     let fingerprint = try Self.identityFingerprint(result)
                     accountFingerprint = fingerprint
-                    let identityKey = fingerprint.map { String(format: "%02x", $0) }.joined()
+                    let identityKey = QuotaClient.crossQueryIdentityKey(account: identity, fingerprint: fingerprint)
                     guard !accountOnly && identity.supportsWeeklyQuota else {
                         return QuotaReading(windows: [], receivedAt: Date(), account: identity, identityKey: identityKey)
                     }
@@ -498,7 +505,7 @@ private final class QuotaRequest {
                     guard let result = message["result"] as? [String: Any] else {
                         throw QuotaClientError.invalidResponse
                     }
-                    let identityKey = accountFingerprint?.map { String(format: "%02x", $0) }.joined()
+                    let identityKey = accountFingerprint.flatMap { QuotaClient.crossQueryIdentityKey(account: account, fingerprint: $0) }
                     pendingReading = try QuotaClient.parse(result, account: account, identityKey: identityKey)
                     stage = "confirm"
                     try send(["id": confirmationID, "method": "account/read", "params": ["refreshToken": false]])
@@ -628,6 +635,21 @@ func runQuotaTests() throws {
     }
     let missingEmail = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": NSNull(), "planType": NSNull()]])
     try check(missingEmail.maskedEmail == nil && missingEmail.planName == nil, "Missing identity details remain unknown")
+    let syntheticFingerprint = Data(repeating: 0xAB, count: 32)
+    try check(QuotaClient.crossQueryIdentityKey(account: plus, fingerprint: syntheticFingerprint)?.count == 64,
+              "A parsed valid ChatGPT identity can retain its in-memory comparison key")
+    for email in [NSNull(), "", "not-an-email", "bad@@example.test", true] as [Any] {
+        let unknown = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "email": email, "planType": "plus"]])
+        try check(QuotaClient.crossQueryIdentityKey(account: unknown, fingerprint: syntheticFingerprint) == nil,
+                  "Missing or malformed email must not become trusted identity merely because a digest exists")
+    }
+    let absentEmail = try QuotaClient.parseAccount(["account": ["type": "chatgpt", "planType": "plus"]])
+    try check(QuotaClient.crossQueryIdentityKey(account: absentEmail, fingerprint: syntheticFingerprint) == nil,
+              "Absent email must leave the cross-query comparison key unknown")
+    let noEmailQuota = try QuotaClient.parse(multi, account: absentEmail,
+                                           identityKey: QuotaClient.crossQueryIdentityKey(account: absentEmail, fingerprint: syntheticFingerprint))
+    try check(noEmailQuota.windows.count == 2 && noEmailQuota.identityKey == nil,
+              "A full quota snapshot can display data without asserting an unproven cross-query identity")
     for (raw, expected) in [("plus", "Plus"), ("pro", "Pro"), ("prolite", "Pro Lite"),
                             ("pro_lite", "Pro Lite"), ("team", "Team"), ("business", "Business"),
                             ("enterprise", "Enterprise"), ("free", "Free"), (" future-plan ", "future-plan")] {
@@ -637,10 +659,14 @@ func runQuotaTests() throws {
     let signedOut = try QuotaClient.parseAccount(["account": NSNull()])
     try check(signedOut.authType == "signedOut" && !signedOut.supportsWeeklyQuota && signedOut.displayName == "未登录",
               "Signed-out state must be explicit")
+    try check(QuotaClient.crossQueryIdentityKey(account: signedOut, fingerprint: syntheticFingerprint) == nil,
+              "Signed-out state must not retain a cross-query account key")
     for type in ["apiKey", "amazonBedrock", "futureAuth"] {
         let identity = try QuotaClient.parseAccount(["account": ["type": type, "email": "ignored@example.com", "planType": "pro"]])
         try check(!identity.supportsWeeklyQuota && identity.authType == type && identity.maskedEmail == nil && identity.planName == nil,
                   "Unsupported auth must not imply ChatGPT identity or quota")
+        try check(QuotaClient.crossQueryIdentityKey(account: identity, fingerprint: syntheticFingerprint) == nil,
+                  "Unsupported auth must not retain a cross-query account key")
     }
     for malformed in [[:], ["account": true], ["account": ["email": "alice@example.com"]]] as [[String: Any]] {
         do {

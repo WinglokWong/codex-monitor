@@ -274,7 +274,7 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
                         account = ParseAccount(result);
                         identityFingerprint = Fingerprint(result);
                         if (accountOnly || !account.SupportsWeeklyQuota)
-                            return new(Array.Empty<WeeklyQuota>(), DateTimeOffset.UtcNow, account, Convert.ToHexString(identityFingerprint));
+                            return new(Array.Empty<WeeklyQuota>(), DateTimeOffset.UtcNow, account, StorageIdentityKey(account, identityFingerprint));
                         stage = "quota";
                         await SendAsync(new { id = 2, method = "account/rateLimits/read" }).ConfigureAwait(false);
                     }
@@ -282,7 +282,7 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
                     {
                         pendingReading = ParseQuota(GetResult(message, stage), account) with
                         {
-                            IdentityKey = Convert.ToHexString(identityFingerprint!)
+                            IdentityKey = StorageIdentityKey(account, identityFingerprint!)
                         };
                         stage = "confirm";
                         await SendAsync(new { id = confirmationId, method = "account/read", @params = new { refreshToken = false } }).ConfigureAwait(false);
@@ -388,6 +388,11 @@ public sealed class QuotaClient(string? executableOverride = null) : IQuotaClien
             throw new QuotaException(QuotaErrorKind.InvalidResponse, stage);
         return result;
     }
+
+    // Unknown email cannot identify an account across independent reads. Keep the
+    // full-query confirmation digest internal, but do not use it to preserve old quota.
+    private static string? StorageIdentityKey(AccountSummary account, byte[] fingerprint) =>
+        account.AuthType == "chatgpt" && account.MaskedEmail is not null ? Convert.ToHexString(fingerprint) : null;
 
     private static byte[] Fingerprint(JsonElement result)
     {

@@ -57,6 +57,8 @@ internal static class FakeCli
                 object? account;
                 if (scenario == "signed_out") account = null;
                 else if (scenario == "api_key") account = new { type = "apiKey" };
+                else if (scenario == "missing_email") account = new { type = "chatgpt", planType = "plus" };
+                else if (scenario == "malformed_email") account = new { type = "chatgpt", email = "not-an-email", planType = "plus" };
                 else
                 {
                     string email = accountReads > 1 && (scenario is "account_changed" or "silent_account_changed")

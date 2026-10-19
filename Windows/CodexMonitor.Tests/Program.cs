@@ -25,10 +25,10 @@ internal static class Program
             await RunAsync("account identity changes invalidate old quota", TestAccountIdentityAsync);
             await RunAsync("stop suppresses account-only completions", TestAccountStopAsync);
             foreach (string scenario in new[] { "chatgpt", "benign_before_quota", "benign_before_confirmation", "benign_after_confirmation",
-                "signed_out", "api_key", "account_changed", "silent_account_changed", "same_mask_account_changed", "account_error",
+                "signed_out", "api_key", "missing_email", "malformed_email", "account_changed", "silent_account_changed", "same_mask_account_changed", "account_error",
                 "quota_error", "malformed_json", "structured_auth_error", "rate_limited", "unknown_rpc_error", "quota_eof" })
                 await RunAsync("synthetic protocol: " + scenario, () => TestProtocolAsync(scenario));
-            foreach (string scenario in new[] { "chatgpt", "signed_out", "api_key", "account_error" })
+            foreach (string scenario in new[] { "chatgpt", "signed_out", "api_key", "missing_email", "malformed_email", "account_error" })
                 await RunAsync("account-only protocol: " + scenario, () => TestProtocolAsync(scenario, accountOnly: true));
             await RunAsync("system metric counter self-tests", RunMetricTestsAsync);
             if (OperatingSystem.IsWindows()) await RunAsync("native Windows system metrics", RunNativeMetricSmokeAsync);
@@ -339,6 +339,29 @@ internal static class Program
             Require(client.QuotaCalls == 1 && state.NextQuotaQueryAt == Synthetic.Epoch.AddMinutes(10), "Identity change must not trigger an early quota query");
             state.Stop();
         }
+        foreach (string accountJson in new[]
+        {
+            """{"account":{"type":"chatgpt","planType":"plus"}}""",
+            """{"account":{"type":"chatgpt","email":"not-an-email","planType":"plus"}}"""
+        })
+        {
+            var clock = new FakeClock();
+            var client = new QueueClient();
+            var unknownAccount = QuotaClient.ParseAccount(Json(accountJson));
+            var directQuota = Reading(clock.Now) with { Account = unknownAccount, IdentityKey = null };
+            client.Succeed(directQuota);
+            client.SucceedAccount(new QuotaReading([], clock.Now.AddMinutes(1), unknownAccount, null));
+            var state = new MonitorState(client, () => clock.Now, accountIntervalMinutes: 1, quotaIntervalMinutes: 10);
+            await state.RefreshAsync();
+            Require(state.RemainingPercent == 73 && state.Reading?.IdentityKey is null,
+                "A directly verified full query may display quota without a stored identity key");
+            await TickAsync(state, clock, 60);
+            Require(state.Account == unknownAccount && state.Reading is null,
+                "Missing/malformed account email cannot preserve old quota across independent reads");
+            Require(client.QuotaCalls == 1 && state.NextQuotaQueryAt == Synthetic.Epoch.AddMinutes(10),
+                "Unknown account identity must not bring the quota deadline forward");
+            state.Stop();
+        }
     }
 
     private static async Task TestAccountStopAsync()
@@ -386,18 +409,23 @@ internal static class Program
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(25));
             try { reading = accountOnly ? await client.ReadAccountAsync(deadline.Token) : await client.ReadAsync(deadline.Token); }
             catch (QuotaException error) { failure = error; }
-            bool success = scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation" or "signed_out" or "api_key";
+            bool success = scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation"
+                or "signed_out" or "api_key" or "missing_email" or "malformed_email";
             Require(success == (reading is not null && failure is null), "Unexpected protocol outcome: " + scenario);
             if (reading is not null)
             {
                 AssertPrivateDataAbsent(JsonSerializer.Serialize(reading));
-                Require(!string.IsNullOrEmpty(reading.IdentityKey), "Client reads must include an in-memory identity key");
-                Require(!JsonSerializer.Serialize(reading).Contains(reading.IdentityKey!, StringComparison.Ordinal), "Identity key leaked into JSON");
+                bool knownIdentity = reading.Account.AuthType == "chatgpt" && reading.Account.MaskedEmail is not null;
+                Require(knownIdentity ? !string.IsNullOrEmpty(reading.IdentityKey) : reading.IdentityKey is null,
+                    "Only a ChatGPT account with a valid email may have a stored identity key");
+                if (reading.IdentityKey is { } key)
+                    Require(!JsonSerializer.Serialize(reading).Contains(key, StringComparison.Ordinal), "Identity key leaked into JSON");
                 if (scenario is "signed_out" or "api_key")
                     Require(reading.Windows.Count == 0 && !reading.Account.SupportsWeeklyQuota && reading.Account.MaskedEmail is null,
                         "Unsupported login published old quota or identity");
                 else
-                    Require(reading.Account.MaskedEmail == Synthetic.MaskedEmail && reading.Account.PlanName == "Plus"
+                    Require((scenario is "missing_email" or "malformed_email" ? reading.Account.MaskedEmail is null : reading.Account.MaskedEmail == Synthetic.MaskedEmail)
+                        && reading.Account.PlanName == "Plus"
                         && (accountOnly ? reading.Windows.Count == 0 : reading.Windows.Count == 1 && reading.Windows[0].RemainingPercent == 73), "Identity/quota pairing failed");
             }
             if (failure is not null)
@@ -415,7 +443,7 @@ internal static class Program
             var expected = new List<string> { "initialize", "initialized", "account/read" };
             bool quota = !accountOnly && scenario is not ("signed_out" or "api_key" or "account_error" or "malformed_json");
             bool confirm = !accountOnly && (scenario is "chatgpt" or "benign_before_quota" or "benign_before_confirmation" or "benign_after_confirmation"
-                or "account_changed" or "silent_account_changed" or "same_mask_account_changed");
+                or "missing_email" or "malformed_email" or "account_changed" or "silent_account_changed" or "same_mask_account_changed");
             if (quota) expected.Add("account/rateLimits/read");
             if (confirm) expected.Add("account/read");
             if (!accountOnly && scenario == "benign_after_confirmation") expected.Add("account/read");
